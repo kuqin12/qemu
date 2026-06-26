@@ -48,9 +48,12 @@
 #
 # @emulator: Software Emulator TPM type (since 2.11)
 #
+# @mssim: Microsoft TPM simulator (mssim) TCP socket backend (since
+#     11.1)
+#
 # Since: 1.5
 ##
-{ 'enum': 'TpmType', 'data': [ 'passthrough', 'emulator' ],
+{ 'enum': 'TpmType', 'data': [ 'passthrough', 'emulator', 'mssim' ],
   'if': 'CONFIG_TPM' }
 
 ##
@@ -98,6 +101,23 @@
   'if': 'CONFIG_TPM' }
 
 ##
+# @TPMMssimOptions:
+#
+# Information about the Microsoft TPM simulator (mssim) type
+#
+# @host: IP address or hostname the TPM simulator is listening on
+#     (default '127.0.0.1')
+#
+# @port: the TPM simulator's command port (default '2321'); the
+#     platform port is always this port number plus one
+#
+# Since: 11.1
+##
+{ 'struct': 'TPMMssimOptions',
+  'data': { '*host': 'str', '*port': 'str' },
+  'if': 'CONFIG_TPM' }
+
+##
 # @TPMPassthroughOptionsWrapper:
 #
 # @data: Information about the TPM passthrough type
@@ -120,6 +140,17 @@
   'if': 'CONFIG_TPM' }
 
 ##
+# @TPMMssimOptionsWrapper:
+#
+# @data: Information about the Microsoft TPM simulator (mssim) type
+#
+# Since: 11.1
+##
+{ 'struct': 'TPMMssimOptionsWrapper',
+  'data': { 'data': 'TPMMssimOptions' },
+  'if': 'CONFIG_TPM' }
+
+##
 # @TpmTypeOptions:
 #
 # A union referencing different TPM backend types' configuration
@@ -130,6 +161,8 @@
 #       passthrough type
 #     - 'emulator' The configuration options for TPM emulator backend
 #       type
+#     - 'mssim' The configuration options for the Microsoft TPM
+#       simulator (mssim) backend type
 #
 # Since: 1.5
 ##
@@ -137,7 +170,8 @@
   'base': { 'type': 'TpmType' },
   'discriminator': 'type',
   'data': { 'passthrough' : 'TPMPassthroughOptionsWrapper',
-            'emulator': 'TPMEmulatorOptionsWrapper' },
+            'emulator': 'TPMEmulatorOptionsWrapper',
+            'mssim': 'TPMMssimOptionsWrapper' },
   'if': 'CONFIG_TPM' }
 
 ##
