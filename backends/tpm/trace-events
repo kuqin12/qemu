@@ -34,3 +34,7 @@ tpm_emulator_set_state_blobs_error(const char *msg) "error while setting state b
 tpm_emulator_set_state_blobs_done(void) "Done setting state blobs"
 tpm_emulator_pre_save(void) ""
 tpm_emulator_inst_init(void) ""
+
+# tpm_mssim.c
+tpm_mssim_handle_request(void) "processing TPM command"
+tpm_mssim_inst_init(void) ""
