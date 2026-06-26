@@ -219,9 +219,8 @@ vfio_user_server_allowed = get_option('vfio_user_server') \
   .require(host_os == 'linux', error_message: 'vfio-user server is supported only on Linux') \
   .allowed()
 
-have_tpm = get_option('tpm') \
-  .require(host_os != 'windows', error_message: 'TPM emulation only available on POSIX systems') \
-  .allowed()
+# TPM backends
+have_tpm = get_option('tpm').allowed()
 
 # vhost
 have_vhost_user = get_option('vhost_user') \
