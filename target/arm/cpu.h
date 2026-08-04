@@ -1002,6 +1002,8 @@ struct ArchCPU {
     bool has_el2;
     /* CPU has security extension */
     bool has_el3;
+    /* CPU executes only in the secondary TCG domain. */
+    bool shadow_tcg;
     /* CPU has PMU (Performance Monitor Unit) */
     bool has_pmu;
     /* CPU has VFP */
@@ -1191,6 +1193,7 @@ struct ARMCPUClass {
 
     const ARMCPUInfo *info;
     DeviceRealize parent_realize;
+    DeviceUnrealize parent_unrealize;
     ResettablePhases parent_phases;
 };
 

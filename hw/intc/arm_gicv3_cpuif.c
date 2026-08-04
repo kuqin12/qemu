@@ -3056,7 +3056,9 @@ void gicv3_init_cpuif(GICv3State *s, Error **errp)
     int i;
 
     for (i = 0; i < s->num_cpu; i++) {
-        ARMCPU *cpu = ARM_CPU(qemu_get_cpu(s->first_cpu_idx + i));
+        CPUState *cpu_state =
+            s->linked_cpu ?: qemu_get_cpu(s->first_cpu_idx + i);
+        ARMCPU *cpu = ARM_CPU(cpu_state);
         GICv3CPUState *cs = &s->cpu[i];
 
         if (cpu_isar_feature(aa64_gcie, cpu)) {

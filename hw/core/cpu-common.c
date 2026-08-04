@@ -333,7 +333,7 @@ static void cpu_common_initfn(Object *obj)
      * created to ensure we don't race.
      */
 #ifdef CONFIG_PLUGIN
-    if (tcg_enabled()) {
+    if (tcg_enabled() && !tcg_secondary_active) {
         cpu->plugin_state = qemu_plugin_create_vcpu_state();
         qemu_plugin_vcpu_init_hook(cpu);
     }

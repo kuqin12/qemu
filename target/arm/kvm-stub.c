@@ -100,6 +100,12 @@ void arm_cpu_kvm_set_irq(void *arm_cpu, int irq, int level)
     g_assert_not_reached();
 }
 
+int kvm_arm_set_bl33_handoff(ARMCPU *cpu, uint64_t entry,
+                             const uint64_t xregs[4])
+{
+    return -ENOSYS;
+}
+
 void kvm_arm_cpu_pre_save(ARMCPU *cpu)
 {
     g_assert_not_reached();

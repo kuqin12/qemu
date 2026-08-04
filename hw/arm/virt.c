@@ -68,6 +68,7 @@
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gicv3_common.h"
 #include "hw/intc/arm_gicv3_its_common.h"
+#include "hw/intc/arm_gicv3.h"
 #include "hw/intc/arm_gicv5_common.h"
 #include "hw/core/irq.h"
 #include "kvm_arm.h"
@@ -92,6 +93,8 @@
 #include "hw/virtio/virtio-iommu.h"
 #include "hw/char/pl011.h"
 #include "hw/core/cpu.h"
+#include "migration/blocker.h"
+#include "system/reset.h"
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_host.h"
 #include "qemu/guest-random.h"
@@ -424,7 +427,7 @@ static void create_fdt(VirtMachineState *vms)
         create_randomness(ms, "/chosen");
     }
 
-    if (vms->secure) {
+    if (vms->secure || vms->hybrid_secure) {
         qemu_fdt_add_subnode(fdt, "/secure-chosen");
         if (vms->dtb_randomness) {
             create_randomness(ms, "/secure-chosen");
@@ -1462,6 +1465,73 @@ static void create_gicv3(VirtMachineState *vms, MemoryRegion *mem)
     fdt_add_gic_node(vms);
 }
 
+static void create_hybrid_secure_gic(VirtMachineState *vms)
+{
+    DeviceState *cpudev = DEVICE(vms->hybrid_shadow_cpu);
+    DeviceState *gic = qdev_new(TYPE_ARM_GICV3);
+    SysBusDevice *gicbusdev = SYS_BUS_DEVICE(gic);
+    QList *redist_region_count = qlist_new();
+    int intidbase = NUM_IRQS;
+    const int timer_irq[] = {
+        [GTIMER_PHYS] = ARCH_TIMER_NS_EL1_IRQ,
+        [GTIMER_VIRT] = ARCH_TIMER_VIRT_IRQ,
+        [GTIMER_HYP] = ARCH_TIMER_NS_EL2_IRQ,
+        [GTIMER_SEC] = ARCH_TIMER_S_EL1_IRQ,
+        [GTIMER_HYPVIRT] = ARCH_TIMER_NS_EL2_VIRT_IRQ,
+        [GTIMER_S_EL2_PHYS] = ARCH_TIMER_S_EL2_IRQ,
+        [GTIMER_S_EL2_VIRT] = ARCH_TIMER_S_EL2_VIRT_IRQ,
+    };
+
+    qdev_prop_set_uint32(gic, "revision", 3);
+    qdev_prop_set_uint32(gic, "num-cpu", 1);
+    qdev_prop_set_uint32(gic, "num-irq", NUM_IRQS + 32);
+    qdev_prop_set_bit(gic, "has-security-extensions", true);
+    object_property_set_link(OBJECT(gic), "linked-cpu", OBJECT(cpudev),
+                             &error_abort);
+    qlist_append_int(redist_region_count, 1);
+    qdev_prop_set_array(gic, "redist-region-count", redist_region_count);
+    tcg_secondary_active = true;
+    sysbus_realize_and_unref(gicbusdev, &error_fatal);
+    tcg_secondary_active = false;
+    resettable_change_parent(OBJECT(gic), NULL,
+                             OBJECT(DEVICE(gic)->parent_bus));
+
+    memory_region_add_subregion_overlap(
+        vms->secure_sysmem, vms->memmap[VIRT_GIC_DIST].base,
+        sysbus_mmio_get_region(gicbusdev, 0), 0);
+    memory_region_add_subregion_overlap(
+        vms->secure_sysmem, vms->memmap[VIRT_GIC_REDIST].base,
+        sysbus_mmio_get_region(gicbusdev, 1), 0);
+
+    for (unsigned irq = 0; irq < ARRAY_SIZE(timer_irq); irq++) {
+        qdev_connect_gpio_out(cpudev, irq,
+                              qdev_get_gpio_in(gic,
+                                               intidbase + timer_irq[irq]));
+    }
+    qdev_connect_gpio_out_named(
+        cpudev, "gicv3-maintenance-interrupt", 0,
+        qdev_get_gpio_in(gic, intidbase + ARCH_GIC_MAINT_IRQ));
+    qdev_connect_gpio_out_named(cpudev, "pmu-interrupt", 0,
+                                qdev_get_gpio_in(gic,
+                                                intidbase + VIRTUAL_PMU_IRQ));
+
+    sysbus_connect_irq(gicbusdev, 0,
+                       qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+    sysbus_connect_irq(gicbusdev, 1,
+                       qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+    sysbus_connect_irq(gicbusdev, 2,
+                       qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
+    sysbus_connect_irq(gicbusdev, 3,
+                       qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
+    sysbus_connect_irq(gicbusdev, 4,
+                       qdev_get_gpio_in(cpudev, ARM_CPU_NMI));
+    sysbus_connect_irq(gicbusdev, 5,
+                       qdev_get_gpio_in(cpudev, ARM_CPU_VINMI));
+
+    device_cold_reset(gic);
+    vms->hybrid_secure_gic = gic;
+}
+
 static void create_gic(VirtMachineState *vms, MemoryRegion *mem)
 {
     switch (vms->gic_version) {
@@ -2321,6 +2391,288 @@ static void create_secure_ram(VirtMachineState *vms,
     g_free(nodename);
 }
 
+static void virt_hybrid_shadow_execute(VirtMachineState *vms)
+{
+    CPUState *cs = vms->hybrid_shadow_cpu;
+    ARMCPU *cpu = ARM_CPU(cs);
+    AddressSpace *as = cpu_get_address_space(cs, ARMASIdx_S);
+    int ret;
+
+    cs->stopped = false;
+    cs->halted = false;
+    ret = tcg_secondary_cpu_exec(cs);
+    vms->hybrid_shadow_stop_reason = ret;
+    vms->hybrid_shadow_smoke_x0 = cpu->env.xregs[0];
+    vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
+    if (vms->hybrid_shadow_stage == 1) {
+        uint64_t bl33_xregs[ARRAY_SIZE(cpu->env.xregs)];
+        uint64_t bl33_pstate;
+        uint64_t bl33_sp_el2;
+        uint64_t bl33_elr_el2;
+        uint32_t saved_code[2];
+        uint32_t direct_code[] = {
+            cpu_to_le32(0xd4000003), /* smc #0 */
+            cpu_to_le32(0xd503201f), /* nop */
+        };
+        MemTxResult result;
+        bool code_patched = false;
+        bool return_breakpoint = false;
+
+        vms->hybrid_shadow_bootstrap_passed =
+            ret == EXCP_DEBUG && vms->hybrid_shadow_stop_pc == 0x04000000;
+        if (!vms->hybrid_shadow_bootstrap_passed) {
+            goto out;
+        }
+
+        cpu_breakpoint_remove(cs, 0x04000000, BP_GDB);
+        memcpy(bl33_xregs, cpu->env.xregs, sizeof(bl33_xregs));
+        bl33_pstate = pstate_read(&cpu->env);
+        bl33_sp_el2 = cpu->env.sp_el[2];
+        bl33_elr_el2 = cpu->env.elr_el[2];
+        result = address_space_read(as, 0x40100000,
+                                    MEMTXATTRS_UNSPECIFIED,
+                                    saved_code, sizeof(saved_code));
+        if (result != MEMTX_OK) {
+            goto out;
+        }
+        code_patched = true;
+        result = address_space_write(as, 0x40100000,
+                                     MEMTXATTRS_UNSPECIFIED,
+                                     direct_code, sizeof(direct_code));
+        if (result != MEMTX_OK) {
+            goto direct_cleanup;
+        }
+
+        memset(cpu->env.xregs, 0, sizeof(bl33_xregs));
+        cpu->env.xregs[0] = 0xc400008d;
+        cpu->env.xregs[1] = 0x00008002;
+        cpu->env.xregs[2] = 0xaf4f0618a462b817;
+        cpu->env.xregs[3] = 0x613835589a08b386;
+        cpu->env.xregs[4] = 0x0f000001;
+        cpu_set_pc(cs, 0x40100000);
+        arm_rebuild_hflags(&cpu->env);
+        cs->exception_index = -1;
+        cs->halted = false;
+        if (cpu_breakpoint_insert(cs, 0x40100004, BP_GDB, NULL)) {
+            goto direct_cleanup;
+        }
+        return_breakpoint = true;
+
+        vms->hybrid_shadow_stage = 2;
+        ret = tcg_secondary_cpu_exec(cs);
+        vms->hybrid_shadow_stop_reason = ret;
+        vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
+        vms->hybrid_shadow_direct_x0 = cpu->env.xregs[0];
+        vms->hybrid_shadow_direct_x4 = cpu->env.xregs[4];
+        vms->hybrid_shadow_direct_x5 = cpu->env.xregs[5];
+        vms->hybrid_shadow_direct_passed =
+            ret == EXCP_DEBUG &&
+            vms->hybrid_shadow_stop_pc == 0x40100004 &&
+            cpu->env.xregs[0] == 0xc400008e &&
+            cpu->env.xregs[1] == 0x80020000 &&
+            (cpu->env.xregs[4] == UINT64_MAX ||
+             (cpu->env.xregs[4] == 0x05000002 &&
+              cpu->env.xregs[5] == 0x00010000));
+
+direct_cleanup:
+        if (return_breakpoint) {
+            cpu_breakpoint_remove(cs, 0x40100004, BP_GDB);
+        }
+        if (code_patched) {
+            result = address_space_write(as, 0x40100000,
+                                         MEMTXATTRS_UNSPECIFIED,
+                                         saved_code, sizeof(saved_code));
+            if (result != MEMTX_OK) {
+                vms->hybrid_shadow_direct_passed = false;
+                error_report("mach-virt: failed to restore hybrid direct "
+                             "request smoke code");
+            }
+        }
+        memcpy(cpu->env.xregs, bl33_xregs, sizeof(bl33_xregs));
+        pstate_write(&cpu->env, bl33_pstate);
+        cpu->env.sp_el[2] = bl33_sp_el2;
+        cpu->env.elr_el[2] = bl33_elr_el2;
+        cpu_set_pc(cs, 0x04000000);
+        arm_rebuild_hflags(&cpu->env);
+    } else {
+        vms->hybrid_shadow_smoke_passed =
+            ret == EXCP_HLT && vms->hybrid_shadow_smoke_x0 == 42;
+    }
+out:
+    return;
+}
+
+static void *virt_hybrid_shadow_worker(void *opaque)
+{
+    VirtMachineState *vms = opaque;
+
+    tcg_secondary_cpu_thread_init(vms->hybrid_shadow_cpu);
+    qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    vms->hybrid_shadow_worker_alive = true;
+
+    for (;;) {
+        while (!vms->hybrid_shadow_worker_request &&
+               !vms->hybrid_shadow_worker_stop) {
+            qemu_cond_wait(&vms->hybrid_shadow_cond,
+                           &vms->hybrid_shadow_mutex);
+        }
+
+        if (vms->hybrid_shadow_worker_stop) {
+            break;
+        }
+
+        vms->hybrid_shadow_worker_request = false;
+        virt_hybrid_shadow_execute(vms);
+        vms->hybrid_shadow_worker_done = true;
+        qemu_cond_signal(&vms->hybrid_shadow_cond);
+    }
+
+    vms->hybrid_shadow_worker_alive = false;
+    qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+    tcg_secondary_cpu_thread_destroy();
+    return NULL;
+}
+
+static void virt_hybrid_shadow_run_worker(VirtMachineState *vms)
+{
+    if (!vms->hybrid_shadow_worker_created) {
+        qemu_mutex_init(&vms->hybrid_shadow_mutex);
+        qemu_cond_init(&vms->hybrid_shadow_cond);
+        qemu_thread_create(&vms->hybrid_shadow_thread, "hybrid-secure",
+                           virt_hybrid_shadow_worker, vms,
+                           QEMU_THREAD_JOINABLE);
+        vms->hybrid_shadow_worker_created = true;
+    }
+
+    qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    vms->hybrid_shadow_worker_done = false;
+    vms->hybrid_shadow_worker_request = true;
+    qemu_cond_signal(&vms->hybrid_shadow_cond);
+    bql_unlock();
+    while (!vms->hybrid_shadow_worker_done) {
+        qemu_cond_wait(&vms->hybrid_shadow_cond,
+                       &vms->hybrid_shadow_mutex);
+    }
+    qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+    bql_lock();
+}
+
+static void virt_hybrid_kvm_handoff_reset(void *opaque)
+{
+    VirtMachineState *vms = opaque;
+    ARMCPU *cpu = ARM_CPU(first_cpu);
+    int ret;
+
+    if (!vms->hybrid_kvm_handoff_pending) {
+        return;
+    }
+
+    ret = kvm_arm_set_bl33_handoff(cpu, 0x04000000,
+                                   vms->hybrid_bl33_xregs);
+    if (ret) {
+        error_report("mach-virt: failed to transfer BL33 state to KVM: %s",
+                     strerror(-ret));
+        exit(1);
+    }
+
+    vms->hybrid_kvm_handoff_pending = false;
+    vms->hybrid_kvm_handoff_ready = true;
+}
+
+static void virt_machine_reset(MachineState *machine, ResetType type)
+{
+    VirtMachineState *vms = VIRT_MACHINE(machine);
+
+    if (!vms->hybrid_secure) {
+        qemu_devices_reset(type);
+        return;
+    }
+
+    if (vms->hybrid_initial_reset_done) {
+        error_report("mach-virt: hybrid-secure does not support reset");
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
+        return;
+    }
+
+    qemu_devices_reset(type);
+    virt_hybrid_kvm_handoff_reset(vms);
+    vms->hybrid_initial_reset_done = true;
+}
+
+static void virt_hybrid_shadow_boot(VirtMachineState *vms,
+                                    bool firmware_loaded)
+{
+    uint32_t code[] = {
+        0xd2800540, /* mov x0, #42 */
+        0xd503207f, /* wfi */
+    };
+    CPUState *cs = vms->hybrid_shadow_cpu;
+    ARMCPU *cpu = ARM_CPU(cs);
+    AddressSpace *as = cpu_get_address_space(cs, ARMASIdx_S);
+    hwaddr entry = vms->memmap[VIRT_SECURE_MEM].base;
+    MemTxResult result;
+
+    if (firmware_loaded) {
+        vms->hybrid_shadow_stage = 1;
+        if (cpu_breakpoint_insert(cs, 0x04000000, BP_GDB, NULL)) {
+            error_report("mach-virt: failed to set hybrid BL33 boundary");
+            exit(1);
+        }
+        cpu_set_pc(cs, 0);
+        arm_rebuild_hflags(&cpu->env);
+        virt_hybrid_shadow_run_worker(vms);
+
+        if (!vms->hybrid_shadow_bootstrap_passed) {
+            error_report("mach-virt: hybrid secure firmware did not reach "
+                         "the BL33 boundary (reason %d, PC 0x%" PRIx64
+                         ", x30 0x%" PRIx64 ", x0 0x%" PRIx64
+                         ", ESR_EL3 0x%" PRIx64 ", ELR_EL3 0x%" PRIx64 ")",
+                         vms->hybrid_shadow_stop_reason,
+                         vms->hybrid_shadow_stop_pc,
+                         cpu->env.xregs[30], cpu->env.xregs[0],
+                         cpu->env.cp15.esr_el[3], cpu->env.elr_el[3]);
+            exit(1);
+        }
+        if (!vms->hybrid_shadow_direct_passed) {
+            error_report("mach-virt: hybrid FF-A direct request failed "
+                         "(reason %d, PC 0x%" PRIx64 ", x0 0x%" PRIx64
+                         ", x4 0x%" PRIx64 ", x5 0x%" PRIx64 ")",
+                         vms->hybrid_shadow_stop_reason,
+                         vms->hybrid_shadow_stop_pc,
+                         vms->hybrid_shadow_direct_x0,
+                         vms->hybrid_shadow_direct_x4,
+                         vms->hybrid_shadow_direct_x5);
+            exit(1);
+        }
+
+         memcpy(vms->hybrid_bl33_xregs, cpu->env.xregs,
+             sizeof(vms->hybrid_bl33_xregs));
+        return;
+    }
+
+    vms->hybrid_shadow_stage = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(code); i++) {
+        code[i] = cpu_to_le32(code[i]);
+    }
+
+    result = address_space_write(as, entry, MEMTXATTRS_UNSPECIFIED,
+                                 code, sizeof(code));
+    if (result != MEMTX_OK) {
+        error_report("mach-virt: failed to write hybrid shadow smoke code");
+        exit(1);
+    }
+
+    cpu_set_pc(cs, entry);
+    arm_rebuild_hflags(&cpu->env);
+    virt_hybrid_shadow_run_worker(vms);
+
+    if (!vms->hybrid_shadow_smoke_passed) {
+        error_report("mach-virt: hybrid shadow execution smoke test failed");
+        exit(1);
+    }
+}
+
 static void *machvirt_dtb(const struct arm_boot_info *binfo, int *fdt_size)
 {
     const VirtMachineState *board = container_of(binfo, VirtMachineState,
@@ -2424,6 +2776,10 @@ void virt_machine_done(Notifier *notifier, void *data)
 
     virt_acpi_setup(vms);
     virt_build_smbios(vms);
+
+    if (vms->hybrid_secure && vms->hybrid_shadow_bootstrap_passed) {
+        vms->hybrid_kvm_handoff_pending = true;
+    }
 }
 
 static uint64_t virt_cpu_mp_affinity(VirtMachineState *vms, int idx)
@@ -2868,6 +3224,28 @@ static void machvirt_init(MachineState *machine)
     unsigned int smp_cpus = machine->smp.cpus;
     unsigned int max_cpus = machine->smp.max_cpus;
 
+    if (vms->hybrid_secure) {
+        if (!kvm_enabled()) {
+            error_report("mach-virt: hybrid-secure requires KVM");
+            exit(1);
+        }
+        if (vms->secure) {
+            error_report("mach-virt: hybrid-secure and secure cannot both "
+                         "be enabled");
+            exit(1);
+        }
+        if (!tcg_init_secondary()) {
+            error_report("mach-virt: hybrid-secure requires TCG support");
+            exit(1);
+        }
+        error_setg(&vms->hybrid_migration_blocker,
+                   "hybrid-secure does not support migration");
+        if (migrate_add_blocker(&vms->hybrid_migration_blocker,
+                                &error_fatal)) {
+            exit(1);
+        }
+    }
+
     possible_cpus = mc->possible_cpu_arch_ids(machine);
 
     /*
@@ -2901,7 +3279,7 @@ static void machvirt_init(MachineState *machine)
     finalize_gic_version(vms);
     finalize_msi_controller(vms);
 
-    if (vms->secure) {
+    if (vms->secure || vms->hybrid_secure) {
         /*
          * The Secure view of the world is the same as the NonSecure,
          * but with a few extra devices. Create it as a container region
@@ -2913,6 +3291,18 @@ static void machvirt_init(MachineState *machine)
         memory_region_init(secure_sysmem, OBJECT(machine), "secure-memory",
                            UINT64_MAX);
         memory_region_add_subregion_overlap(secure_sysmem, 0, sysmem, -1);
+    }
+
+    if (vms->hybrid_secure) {
+        tag_sysmem = g_new(MemoryRegion, 1);
+        memory_region_init(tag_sysmem, OBJECT(machine),
+                           "hybrid-tag-memory", UINT64_MAX / 32);
+
+        secure_tag_sysmem = g_new(MemoryRegion, 1);
+        memory_region_init(secure_tag_sysmem, OBJECT(machine),
+                           "hybrid-secure-tag-memory", UINT64_MAX / 32);
+        memory_region_add_subregion_overlap(secure_tag_sysmem, 0,
+                                            tag_sysmem, -1);
     }
 
     firmware_loaded = virt_firmware_init(vms, sysmem,
@@ -3116,6 +3506,37 @@ static void machvirt_init(MachineState *machine)
         object_unref(cpuobj);
     }
 
+    if (vms->hybrid_secure) {
+        Object *cpuobj;
+        ARMCPU *cpu;
+        CPUState *cs;
+
+        tcg_secondary_active = true;
+        cpuobj = object_new(ARM_CPU_TYPE_NAME("max"));
+        tcg_secondary_active = false;
+        cpu = ARM_CPU(cpuobj);
+        cs = CPU(cpu);
+
+        cpu->shadow_tcg = true;
+        object_property_set_bool(cpuobj, "sve", false, &error_abort);
+        object_property_set_bool(cpuobj, "sme", false, &error_abort);
+        cs->cpu_index = 0;
+        object_property_set_int(cpuobj, "mp-affinity", 0, &error_abort);
+        object_property_set_link(cpuobj, "memory", OBJECT(sysmem),
+                                 &error_abort);
+        object_property_set_link(cpuobj, "secure-memory",
+                                 OBJECT(secure_sysmem), &error_abort);
+        object_property_set_link(cpuobj, "tag-memory", OBJECT(tag_sysmem),
+                     &error_abort);
+        object_property_set_link(cpuobj, "secure-tag-memory",
+                     OBJECT(secure_tag_sysmem), &error_abort);
+        qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
+
+        vms->hybrid_shadow_cpu = cs;
+        vms->hybrid_shadow_ready = true;
+        object_unref(cpuobj);
+    }
+
     /* Now we've created the CPUs we can see if they have the hypvirt timer */
     vms->ns_el2_virt_timer_irq = ns_el2_virt_timer_present() &&
         !vmc->no_ns_el2_virt_timer_irq;
@@ -3131,6 +3552,9 @@ static void machvirt_init(MachineState *machine)
     virt_flash_fdt(vms, sysmem, secure_sysmem ?: sysmem);
 
     create_gic(vms, sysmem);
+    if (vms->hybrid_secure) {
+        create_hybrid_secure_gic(vms);
+    }
     create_msi_controller(vms);
 
     virt_post_cpus_gic_realized(vms, sysmem);
@@ -3157,7 +3581,7 @@ static void machvirt_init(MachineState *machine)
      * we create it second (and so it appears first in the DTB), because
      * that's what QEMU has always done.
      */
-    if (!vms->secure) {
+    if (!vms->secure && !vms->hybrid_secure) {
         Chardev *serial1 = serial_hd(1);
 
         if (serial1) {
@@ -3166,12 +3590,16 @@ static void machvirt_init(MachineState *machine)
         }
     }
     create_uart(vms, VIRT_UART0, sysmem, serial_hd(0), false);
-    if (vms->secure) {
+    if (vms->secure || vms->hybrid_secure) {
         create_uart(vms, VIRT_UART1, secure_sysmem, serial_hd(1), true);
     }
 
-    if (vms->secure) {
+    if (vms->secure || vms->hybrid_secure) {
         create_secure_ram(vms, secure_sysmem, secure_tag_sysmem);
+    }
+
+    if (vms->hybrid_secure) {
+        virt_hybrid_shadow_boot(vms, firmware_loaded);
     }
 
     if (tag_sysmem) {
@@ -3251,6 +3679,150 @@ static void virt_set_secure(Object *obj, bool value, Error **errp)
     VirtMachineState *vms = VIRT_MACHINE(obj);
 
     vms->secure = value;
+}
+
+static bool virt_get_hybrid_secure(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    return vms->hybrid_secure;
+}
+
+static void virt_set_hybrid_secure(Object *obj, bool value, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    vms->hybrid_secure = value;
+}
+
+static bool virt_get_hybrid_shadow_ready(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    return vms->hybrid_shadow_ready;
+}
+
+static bool virt_get_hybrid_shadow_smoke_passed(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    bool value;
+
+    if (vms->hybrid_shadow_worker_created) {
+        qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    }
+    value = vms->hybrid_shadow_smoke_passed;
+    if (vms->hybrid_shadow_worker_created) {
+        qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+    }
+
+    return value;
+}
+
+static void virt_get_hybrid_shadow_smoke_x0(Object *obj, Visitor *v,
+                                             const char *name, void *opaque,
+                                             Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    uint64_t value;
+
+    if (vms->hybrid_shadow_worker_created) {
+        qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    }
+    value = vms->hybrid_shadow_smoke_x0;
+    if (vms->hybrid_shadow_worker_created) {
+        qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+    }
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static bool virt_get_hybrid_shadow_bootstrap_passed(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    bool value;
+
+    if (!vms->hybrid_shadow_worker_created) {
+        return false;
+    }
+    qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    value = vms->hybrid_shadow_bootstrap_passed;
+    qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+
+    return value;
+}
+
+static bool virt_get_hybrid_shadow_direct_passed(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    bool value;
+
+    if (!vms->hybrid_shadow_worker_created) {
+        return false;
+    }
+    qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    value = vms->hybrid_shadow_direct_passed;
+    qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+
+    return value;
+}
+
+static bool virt_get_hybrid_kvm_handoff_ready(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    return vms->hybrid_kvm_handoff_ready;
+}
+
+static bool virt_get_hybrid_shadow_worker_alive(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    bool value;
+
+    if (!vms->hybrid_shadow_worker_created) {
+        return false;
+    }
+    qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    value = vms->hybrid_shadow_worker_alive;
+    qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+
+    return value;
+}
+
+static void virt_get_hybrid_shadow_stop_pc(Object *obj, Visitor *v,
+                                            const char *name, void *opaque,
+                                            Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    uint64_t value;
+
+    if (vms->hybrid_shadow_worker_created) {
+        qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    }
+    value = vms->hybrid_shadow_stop_pc;
+    if (vms->hybrid_shadow_worker_created) {
+        qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+    }
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void virt_get_hybrid_shadow_current_pc(Object *obj, Visitor *v,
+                                               const char *name, void *opaque,
+                                               Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    uint64_t value;
+
+    if (vms->hybrid_shadow_worker_created) {
+        qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    }
+    value = vms->hybrid_shadow_cpu ?
+        vms->hybrid_shadow_cpu->cc->get_pc(vms->hybrid_shadow_cpu) : 0;
+    if (vms->hybrid_shadow_worker_created) {
+        qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+    }
+
+    visit_type_uint64(v, name, &value, errp);
 }
 
 static bool virt_get_virt(Object *obj, Error **errp)
@@ -4138,6 +4710,7 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     mc->get_default_cpu_node_id = virt_get_default_cpu_node_id;
     mc->kvm_type = virt_kvm_type;
     mc->get_physical_address_range = virt_get_physical_address_range;
+    mc->reset = virt_machine_reset;
     mc->get_kernel_irqchip_default = get_kernel_irqchip_default;
     assert(!mc->get_hotplug_handler);
     mc->get_hotplug_handler = virt_machine_get_hotplug_handler;
@@ -4170,6 +4743,56 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "secure",
                                                 "Set on/off to enable/disable the ARM "
                                                 "Security Extensions (TrustZone)");
+
+    object_class_property_add_bool(oc, "hybrid-secure",
+                                   virt_get_hybrid_secure,
+                                   virt_set_hybrid_secure);
+    object_class_property_set_description(oc, "hybrid-secure",
+        "Initialize a shadow TCG secure execution domain");
+
+    object_class_property_add_bool(oc, "hybrid-shadow-ready",
+                                   virt_get_hybrid_shadow_ready, NULL);
+    object_class_property_set_description(oc, "hybrid-shadow-ready",
+        "Whether the shadow TCG CPU state has been realized");
+
+    object_class_property_add_bool(oc, "hybrid-shadow-smoke-passed",
+                                   virt_get_hybrid_shadow_smoke_passed, NULL);
+    object_class_property_set_description(oc, "hybrid-shadow-smoke-passed",
+        "Whether the shadow TCG execution smoke test passed");
+
+    object_class_property_add(oc, "hybrid-shadow-smoke-x0", "uint64",
+                              virt_get_hybrid_shadow_smoke_x0,
+                              NULL, NULL, NULL);
+
+    object_class_property_add_bool(oc, "hybrid-shadow-bootstrap-passed",
+                                   virt_get_hybrid_shadow_bootstrap_passed,
+                                   NULL);
+    object_class_property_set_description(oc,
+        "hybrid-shadow-bootstrap-passed",
+        "Whether secure firmware reached the BL33 boundary");
+
+    object_class_property_add(oc, "hybrid-shadow-stop-pc", "uint64",
+                              virt_get_hybrid_shadow_stop_pc,
+                              NULL, NULL, NULL);
+
+    object_class_property_add(oc, "hybrid-shadow-current-pc", "uint64",
+                              virt_get_hybrid_shadow_current_pc,
+                              NULL, NULL, NULL);
+
+    object_class_property_add_bool(oc, "hybrid-shadow-direct-passed",
+                                   virt_get_hybrid_shadow_direct_passed, NULL);
+    object_class_property_set_description(oc, "hybrid-shadow-direct-passed",
+        "Whether the synthetic MSSP FF-A direct request returned");
+
+    object_class_property_add_bool(oc, "hybrid-kvm-handoff-ready",
+                                   virt_get_hybrid_kvm_handoff_ready, NULL);
+    object_class_property_set_description(oc, "hybrid-kvm-handoff-ready",
+        "Whether BL33 entry state was transferred to KVM CPU0");
+
+    object_class_property_add_bool(oc, "hybrid-shadow-worker-alive",
+                                   virt_get_hybrid_shadow_worker_alive, NULL);
+    object_class_property_set_description(oc, "hybrid-shadow-worker-alive",
+        "Whether the dedicated shadow TCG worker is available");
 
     object_class_property_add_bool(oc, "virtualization", virt_get_virt,
                                    virt_set_virt);
@@ -4361,6 +4984,19 @@ static void virt_instance_init(Object *obj)
 static void virt_instance_finalize(Object *obj)
 {
     VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    if (vms->hybrid_shadow_worker_created) {
+        qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+        vms->hybrid_shadow_worker_stop = true;
+        qemu_cond_signal(&vms->hybrid_shadow_cond);
+        qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+        qemu_thread_join(&vms->hybrid_shadow_thread);
+        qemu_cond_destroy(&vms->hybrid_shadow_cond);
+        qemu_mutex_destroy(&vms->hybrid_shadow_mutex);
+    }
+    if (vms->hybrid_migration_blocker) {
+        migrate_del_blocker(&vms->hybrid_migration_blocker);
+    }
 
     for (int i = 0; i < ARRAY_SIZE(vms->flash); i++) {
         if (vms->flash[i] && !qdev_is_realized(DEVICE(vms->flash[i]))) {

@@ -26,6 +26,7 @@
 #include "exec/page-protection.h"
 #include "system/memory.h"
 #include "system/physmem.h"
+#include "system/tcg.h"
 #include "accel/tcg/cpu-ldst-common.h"
 #include "accel/tcg/cpu-mmu-index.h"
 #include "exec/cputlb.h"
@@ -360,7 +361,7 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
     CPUState *cpu;
 
     CPU_FOREACH(cpu) {
-        if (cpu != src) {
+        if (cpu != src && cpu->tb_jmp_cache) {
             async_run_on_cpu(cpu, fn, d);
         }
     }
@@ -425,6 +426,11 @@ void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap)
     const run_on_cpu_func fn = tlb_flush_by_mmuidx_async_work;
 
     tlb_debug("mmu_idx: 0x%"PRIx16"\n", idxmap);
+
+    if (tcg_secondary_active) {
+        tlb_flush_by_mmuidx(src_cpu, idxmap);
+        return;
+    }
 
     flush_all_helper(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
     async_safe_run_on_cpu(src_cpu, fn, RUN_ON_CPU_HOST_INT(idxmap));
@@ -620,6 +626,11 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
 {
     tlb_debug("addr: %016" VADDR_PRIx " mmu_idx:%"PRIx16"\n", addr, idxmap);
 
+    if (tcg_secondary_active) {
+        tlb_flush_page_by_mmuidx(src_cpu, addr, idxmap);
+        return;
+    }
+
     /* This should already be page aligned */
     addr &= TARGET_PAGE_MASK;
 
@@ -638,7 +649,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
 
         /* Allocate a separate data block for each destination cpu.  */
         CPU_FOREACH(dst_cpu) {
-            if (dst_cpu != src_cpu) {
+            if (dst_cpu != src_cpu && dst_cpu->tb_jmp_cache) {
                 d = g_new(TLBFlushPageByMMUIdxData, 1);
                 d->addr = addr;
                 d->idxmap = idxmap;
@@ -809,6 +820,11 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
     TLBFlushRangeData d, *p;
     CPUState *dst_cpu;
 
+    if (tcg_secondary_active) {
+        tlb_flush_range_by_mmuidx(src_cpu, addr, len, idxmap, bits);
+        return;
+    }
+
     /* If no page bits are significant, this devolves to tlb_flush. */
     if (bits < TARGET_PAGE_BITS) {
         tlb_flush_by_mmuidx_all_cpus_synced(src_cpu, idxmap);
@@ -831,7 +847,7 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
 
     /* Allocate a separate data block for each destination cpu.  */
     CPU_FOREACH(dst_cpu) {
-        if (dst_cpu != src_cpu) {
+        if (dst_cpu != src_cpu && dst_cpu->tb_jmp_cache) {
             p = g_memdup(&d, sizeof(d));
             async_run_on_cpu(dst_cpu, tlb_flush_range_by_mmuidx_async_1,
                              RUN_ON_CPU_HOST_PTR(p));

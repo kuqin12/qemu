@@ -32,6 +32,7 @@
 #include "qemu/error-report.h"
 #include "qemu/accel.h"
 #include "qemu/atomic.h"
+#include "qemu/rcu.h"
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-builtin-visit.h"
 #include "qemu/units.h"
@@ -83,6 +84,86 @@ static void tcg_accel_instance_init(Object *obj)
 }
 
 bool one_insn_per_tb;
+__thread bool tcg_secondary_active;
+static bool tcg_runtime_initialized;
+
+static void tcg_init_runtime(size_t tb_size, int splitwx,
+                             unsigned max_threads)
+{
+    g_assert(!tcg_runtime_initialized);
+
+    page_init();
+    tb_htable_init();
+    tcg_init(tb_size, splitwx, max_threads);
+
+#if defined(CONFIG_SOFTMMU)
+    tcg_prologue_init();
+#endif
+
+    tcg_runtime_initialized = true;
+}
+
+bool tcg_init_secondary(void)
+{
+    if (tcg_runtime_initialized) {
+        return true;
+    }
+
+    tcg_init_runtime(0, 0, 1);
+    return true;
+}
+
+bool tcg_secondary_cpu_realize(CPUState *cpu, Error **errp)
+{
+    g_assert(tcg_runtime_initialized);
+    return tcg_exec_realizefn(cpu, errp);
+}
+
+void tcg_secondary_cpu_unrealize(CPUState *cpu)
+{
+    tcg_exec_unrealizefn(cpu);
+}
+
+void tcg_secondary_cpu_thread_init(CPUState *cpu)
+{
+    g_assert(tcg_runtime_initialized);
+    g_assert(!tcg_allowed);
+
+    rcu_register_thread();
+    tcg_secondary_active = true;
+    tcg_register_thread();
+    qemu_thread_get_self(cpu->thread);
+    cpu->thread_id = qemu_get_thread_id();
+    current_cpu = cpu;
+    cpu->neg.can_do_io = true;
+}
+
+void tcg_secondary_cpu_thread_destroy(void)
+{
+    current_cpu = NULL;
+    tcg_secondary_active = false;
+    rcu_unregister_thread();
+}
+
+int tcg_secondary_cpu_exec(CPUState *cpu)
+{
+    int ret;
+
+    g_assert(tcg_secondary_active);
+    g_assert(current_cpu == cpu);
+
+    do {
+        cpu_exec_start(cpu);
+        ret = cpu_exec(cpu);
+        cpu_exec_end(cpu);
+
+        if (ret == EXCP_ATOMIC) {
+            cpu_exec_step_atomic(cpu);
+        }
+    } while (ret == EXCP_YIELD || ret == EXCP_INTERRUPT ||
+             ret == EXCP_ATOMIC);
+    return ret;
+}
 
 #ifndef CONFIG_USER_ONLY
 static void tcg_vm_change_state(void *opaque, bool running, RunState state)
@@ -149,17 +230,7 @@ static int tcg_init_machine(AccelState *as, MachineState *ms)
 
     tcg_allowed = true;
 
-    page_init();
-    tb_htable_init();
-    tcg_init(s->tb_size * MiB, s->splitwx_enabled, max_threads);
-
-#if defined(CONFIG_SOFTMMU)
-    /*
-     * There's no guest base to take into account, so go ahead and
-     * initialize the prologue now.
-     */
-    tcg_prologue_init();
-#endif
+    tcg_init_runtime(s->tb_size * MiB, s->splitwx_enabled, max_threads);
 
 #ifdef CONFIG_USER_ONLY
     qdev_create_fake_machine();

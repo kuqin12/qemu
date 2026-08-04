@@ -22,6 +22,7 @@
 #include "qemu/qemu-print.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
+#include "qemu/plugin.h"
 #include "exec/page-vary.h"
 #include "system/whpx.h"
 #include "target/arm/tcg/idau.h"
@@ -668,12 +669,12 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
     arm_set_ah_fp_behaviours(&env->vfp.fp_status[FPST_AH_F16]);
 
 #ifndef CONFIG_USER_ONLY
-    if (kvm_enabled()) {
+    if (kvm_enabled() && !cpu->shadow_tcg) {
         kvm_arm_reset_vcpu(cpu);
     }
 #endif
 
-    if (tcg_enabled()) {
+    if (tcg_enabled() || cpu->shadow_tcg) {
         hw_breakpoint_update_all(cpu);
         hw_watchpoint_update_all(cpu);
 
@@ -1239,7 +1240,7 @@ static void arm_cpu_initfn(Object *obj)
 # endif
 #else
     /* Our inbound IRQ and FIQ lines */
-    if (kvm_enabled()) {
+    if (kvm_enabled() && !tcg_secondary_active) {
         /*
          * VIRQ, VFIQ, NMI, VINMI are unused with KVM but we add
          * them to maintain the same interface as non-KVM CPUs.
@@ -1761,7 +1762,7 @@ void arm_cpu_finalize_features(ARMCPU *cpu, Error **errp)
         }
     }
 
-    if (kvm_enabled()) {
+    if (kvm_enabled() && !cpu->shadow_tcg) {
         kvm_arm_steal_time_finalize(cpu, &local_err);
         if (local_err != NULL) {
             error_propagate(errp, local_err);
@@ -1801,6 +1802,7 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     ARMCPUClass *acc = ARM_CPU_GET_CLASS(dev);
     CPUARMState *env = &cpu->env;
     Error *local_err = NULL;
+    bool use_tcg = tcg_enabled() || cpu->shadow_tcg;
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
     /* Use pc-relative instructions in system-mode */
@@ -1837,7 +1839,7 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
         }
     }
 
-    if (!tcg_enabled() && !qtest_enabled()) {
+    if (!use_tcg && !qtest_enabled()) {
         /*
          * We assume that no accelerator except TCG (and the "not really an
          * accelerator" qtest) can handle these features, because Arm hardware
@@ -1874,7 +1876,14 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     }
 #endif
 
-    cpu_exec_realizefn(cs, &local_err);
+    if (cpu->shadow_tcg) {
+#ifdef CONFIG_PLUGIN
+        cs->plugin_state = qemu_plugin_create_vcpu_state();
+#endif
+        tcg_secondary_cpu_realize(cs, &local_err);
+    } else {
+        cpu_exec_realizefn(cs, &local_err);
+    }
     if (local_err != NULL) {
         error_propagate(errp, local_err);
         return;
@@ -1936,7 +1945,7 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
      * avoid clearing them out so that we don't have QEMU and KVM with
      * different ideas of the ID registers.
      */
-    if (tcg_enabled() && !arm_feature(env, ARM_FEATURE_AARCH64)) {
+    if (use_tcg && !arm_feature(env, ARM_FEATURE_AARCH64)) {
         arm_clear_aarch64_idregs(cpu);
     }
 
@@ -2183,7 +2192,7 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     if (arm_feature(env, ARM_FEATURE_PMU)) {
         pmu_init(cpu);
 
-        if (!kvm_enabled()) {
+        if (use_tcg || !kvm_enabled()) {
             arm_register_pre_el_change_hook(cpu, &pmu_pre_el_change, 0);
             arm_register_el_change_hook(cpu, &pmu_post_el_change, 0);
         }
@@ -2244,7 +2253,7 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
          * The architectural range of GM blocksize is 2-6, however qemu
          * doesn't support blocksize of 2 (see HELPER(ldgm)).
          */
-        if (tcg_enabled()) {
+        if (use_tcg) {
             assert(cpu->gm_blocksize >= 3 && cpu->gm_blocksize <= 6);
         }
 
@@ -2254,7 +2263,7 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
          * the machine, then reduce MTE support to instructions enabled at EL0.
          * This matches Cortex-A710 BROADCASTMTE input being LOW.
          */
-        if (tcg_enabled() && cpu->tag_memory == NULL) {
+        if (use_tcg && cpu->tag_memory == NULL) {
             FIELD_DP64_IDREG(isar, ID_AA64PFR1, MTE, 1);
         }
 
@@ -2262,20 +2271,20 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
          * If MTE is supported by the host, however it should not be
          * enabled on the guest (i.e mte=off), clear guest's MTE bits."
          */
-        if (kvm_enabled() && !cpu->kvm_mte) {
+        if (!cpu->shadow_tcg && kvm_enabled() && !cpu->kvm_mte) {
                 FIELD_DP64_IDREG(isar, ID_AA64PFR1, MTE, 0);
         }
 #endif
     }
 
 #ifndef CONFIG_USER_ONLY
-    if (tcg_enabled() && cpu_isar_feature(aa64_wfxt, cpu)) {
+    if (use_tcg && cpu_isar_feature(aa64_wfxt, cpu)) {
         cpu->wfxt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        arm_wfxt_timer_cb, cpu);
     }
 #endif
 
-    if (tcg_enabled()) {
+    if (use_tcg) {
         /*
          * Don't report some architectural features in the ID registers
          * where TCG does not yet implement it (not even a minimal
@@ -2368,14 +2377,22 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     }
 
 #ifndef CONFIG_USER_ONLY
-    if (tcg_enabled() && cpu_isar_feature(aa64_rme, cpu)) {
+    if (use_tcg && cpu_isar_feature(aa64_rme, cpu)) {
         arm_register_el_change_hook(cpu, &gt_rme_post_el_change, 0);
     }
 #endif
 
+    if (cpu->shadow_tcg) {
+        tcg_secondary_active = true;
+    }
     register_cp_regs_for_features(cpu);
-    arm_cpu_register_gdb_regs_for_features(cpu);
-    arm_cpu_register_gdb_commands(cpu);
+    if (cpu->shadow_tcg) {
+        tcg_secondary_active = false;
+    }
+    if (!cpu->shadow_tcg) {
+        arm_cpu_register_gdb_regs_for_features(cpu);
+        arm_cpu_register_gdb_commands(cpu);
+    }
 
     arm_init_cpreg_list(cpu);
 
@@ -2409,7 +2426,7 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     }
 #endif
 
-    if (tcg_enabled()) {
+    if (use_tcg) {
         int dcz_blocklen = 4 << get_dczid_bs(cpu);
 
         /*
@@ -2433,10 +2450,26 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
         }
     }
 
-    qemu_init_vcpu(cs);
+    if (!cpu->shadow_tcg) {
+        qemu_init_vcpu(cs);
+    }
     cpu_reset(cs);
 
     acc->parent_realize(dev, errp);
+}
+
+static void arm_cpu_unrealizefn(DeviceState *dev)
+{
+    ARMCPU *cpu = ARM_CPU(dev);
+    ARMCPUClass *acc = ARM_CPU_GET_CLASS(dev);
+
+    if (cpu->shadow_tcg) {
+        tcg_secondary_cpu_unrealize(CPU(cpu));
+        cpu_destroy_address_spaces(CPU(cpu));
+        return;
+    }
+
+    acc->parent_unrealize(dev);
 }
 
 static ObjectClass *arm_cpu_class_by_name(const char *cpu_model)
@@ -2604,6 +2637,8 @@ static void arm_cpu_class_init(ObjectClass *oc, const void *data)
 
     device_class_set_parent_realize(dc, arm_cpu_realizefn,
                                     &acc->parent_realize);
+    device_class_set_parent_unrealize(dc, arm_cpu_unrealizefn,
+                                      &acc->parent_unrealize);
 
     device_class_set_props(dc, arm_cpu_properties);
 

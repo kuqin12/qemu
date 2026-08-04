@@ -193,7 +193,7 @@ static void cpu_max_initfn(Object *obj)
     ARMCPU *cpu = ARM_CPU(obj);
     const bool aarch64_enabled = target_aarch64();
 
-    if (hwaccel_enabled()) {
+    if (hwaccel_enabled() && !tcg_secondary_active) {
         assert(aarch64_enabled);
         /*
          * When hardware acceleration enabled, '-cpu max' is

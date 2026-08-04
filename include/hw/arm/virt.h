@@ -32,6 +32,7 @@
 
 #include "exec/hwaddr.h"
 #include "qemu/notify.h"
+#include "qemu/thread.h"
 #include "hw/core/boards.h"
 #include "hw/acpi/ghes.h"
 #include "hw/arm/boot.h"
@@ -163,6 +164,27 @@ struct VirtMachineState {
     FWCfgState *fw_cfg;
     PFlashCFI01 *flash[2];
     bool secure;
+    bool hybrid_secure;
+    bool hybrid_shadow_ready;
+    bool hybrid_shadow_smoke_passed;
+    bool hybrid_shadow_bootstrap_passed;
+    bool hybrid_shadow_direct_passed;
+    bool hybrid_kvm_handoff_ready;
+    bool hybrid_kvm_handoff_pending;
+    bool hybrid_initial_reset_done;
+    bool hybrid_shadow_worker_created;
+    bool hybrid_shadow_worker_alive;
+    bool hybrid_shadow_worker_request;
+    bool hybrid_shadow_worker_done;
+    bool hybrid_shadow_worker_stop;
+    unsigned int hybrid_shadow_stage;
+    uint64_t hybrid_shadow_smoke_x0;
+    uint64_t hybrid_shadow_stop_pc;
+    uint64_t hybrid_shadow_direct_x0;
+    uint64_t hybrid_shadow_direct_x4;
+    uint64_t hybrid_shadow_direct_x5;
+    uint64_t hybrid_bl33_xregs[4];
+    int hybrid_shadow_stop_reason;
     bool highmem;
     bool highmem_compact;
     bool highmem_cxl;
@@ -195,6 +217,11 @@ struct VirtMachineState {
     uint8_t virtio_transports;
     hwaddr highest_gpa;
     DeviceState *gic;
+    DeviceState *hybrid_secure_gic;
+    CPUState *hybrid_shadow_cpu;
+    QemuThread hybrid_shadow_thread;
+    QemuMutex hybrid_shadow_mutex;
+    QemuCond hybrid_shadow_cond;
     DeviceState *acpi_dev;
     Notifier powerdown_notifier;
     Notifier generic_error_notifier;
@@ -204,6 +231,7 @@ struct VirtMachineState {
     bool ns_el2_virt_timer_irq;
     CXLState cxl_devices_state;
     bool legacy_smmuv3_present;
+    Error *hybrid_migration_blocker;
     MemoryRegion *sysmem;
     MemoryRegion *secure_sysmem;
     bool pci_preserve_config;

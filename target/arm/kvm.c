@@ -2458,6 +2458,26 @@ int kvm_arch_put_registers(CPUState *cs, KvmPutState level, Error **errp)
     return kvm_arm_sync_mpstate_to_kvm(cpu);
 }
 
+int kvm_arm_set_bl33_handoff(ARMCPU *cpu, uint64_t entry,
+                             const uint64_t xregs[4])
+{
+    CPUState *cs = CPU(cpu);
+    CPUARMState *env = &cpu->env;
+    int ret;
+
+    for (int i = 0; i < 4; i++) {
+        env->xregs[i] = xregs[i];
+        ret = kvm_set_one_reg(cs, AARCH64_CORE_REG(regs.regs[i]),
+                              &env->xregs[i]);
+        if (ret) {
+            return ret;
+        }
+    }
+
+    env->pc = entry;
+    return kvm_set_one_reg(cs, AARCH64_CORE_REG(regs.pc), &env->pc);
+}
+
 static int kvm_arch_get_fpsimd(CPUState *cs)
 {
     CPUARMState *env = &ARM_CPU(cs)->env;

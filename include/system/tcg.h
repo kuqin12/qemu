@@ -10,11 +10,41 @@
 #ifndef SYSTEM_TCG_H
 #define SYSTEM_TCG_H
 
+#include "qemu/typedefs.h"
+
 #ifdef CONFIG_TCG
 extern bool tcg_allowed;
-#define tcg_enabled() (tcg_allowed)
+extern __thread bool tcg_secondary_active;
+#define tcg_enabled() (tcg_allowed || tcg_secondary_active)
+bool tcg_init_secondary(void);
+bool tcg_secondary_cpu_realize(CPUState *cpu, Error **errp);
+void tcg_secondary_cpu_unrealize(CPUState *cpu);
+void tcg_secondary_cpu_thread_init(CPUState *cpu);
+void tcg_secondary_cpu_thread_destroy(void);
+int tcg_secondary_cpu_exec(CPUState *cpu);
 #else
 #define tcg_enabled() 0
+static inline bool tcg_init_secondary(void)
+{
+	return false;
+}
+static inline bool tcg_secondary_cpu_realize(CPUState *cpu, Error **errp)
+{
+	return false;
+}
+static inline void tcg_secondary_cpu_unrealize(CPUState *cpu)
+{
+}
+static inline void tcg_secondary_cpu_thread_init(CPUState *cpu)
+{
+}
+static inline void tcg_secondary_cpu_thread_destroy(void)
+{
+}
+static inline int tcg_secondary_cpu_exec(CPUState *cpu)
+{
+	return -1;
+}
 #endif
 
 /**

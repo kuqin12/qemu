@@ -439,8 +439,13 @@ static void arm_gicv3_common_realize(DeviceState *dev, Error **errp)
     s->cpu = g_new0(GICv3CPUState, s->num_cpu);
 
     for (i = 0; i < s->num_cpu; i++) {
-        CPUState *cpu = qemu_get_cpu(s->first_cpu_idx + i);
+        CPUState *cpu = s->linked_cpu ?: qemu_get_cpu(s->first_cpu_idx + i);
         uint64_t cpu_affid;
+
+        if (s->linked_cpu && s->num_cpu != 1) {
+            error_setg(errp, "linked-cpu requires num-cpu=1");
+            return;
+        }
 
         s->cpu[i].cpu = cpu;
         s->cpu[i].gic = s;
@@ -618,6 +623,8 @@ static const Property arm_gicv3_common_properties[] = {
                       redist_region_count, qdev_prop_uint32, uint32_t),
     DEFINE_PROP_LINK("sysmem", GICv3State, dma, TYPE_MEMORY_REGION,
                      MemoryRegion *),
+    DEFINE_PROP_LINK("linked-cpu", GICv3State, linked_cpu, TYPE_CPU,
+                     CPUState *),
     DEFINE_PROP_UINT32("first-cpu-index", GICv3State, first_cpu_idx, 0),
 };
 

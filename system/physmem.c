@@ -872,7 +872,12 @@ void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length)
     assert(block == qemu_get_ram_block(end - 1));
     start1 = (uintptr_t)ramblock_ptr(block, start - block->offset);
     CPU_FOREACH(cpu) {
-        tlb_reset_dirty(cpu, start1, length);
+        if (cpu->tb_jmp_cache) {
+            tlb_reset_dirty(cpu, start1, length);
+        }
+    }
+    if (tcg_secondary_active && current_cpu) {
+        tlb_reset_dirty(current_cpu, start1, length);
     }
 }
 
