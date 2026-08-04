@@ -159,6 +159,7 @@ struct KVMState
     bool kvm_dirty_ring_with_bitmap;
     uint64_t kvm_eager_split_size;  /* Eager Page Splitting chunk size */
     bool arm_ffa_forward;
+    uint32_t arm_ffa_stub_delay_ms;
     struct KVMDirtyRingReaper reaper;
     struct KVMMsrEnergy msr_energy;
     NotifyVmexitOption notify_vmexit;

@@ -1624,9 +1624,10 @@ static int kvm_arm_handle_ffa_hypercall(CPUState *cs, struct kvm_run *run)
 {
     ARMCPU *cpu = ARM_CPU(cs);
     CPUARMState *env = &cpu->env;
+    KVMState *s = cs->kvm_state;
     uint64_t func_id = run->hypercall.nr;
 
-    if (!cs->kvm_state->arm_ffa_forward ||
+    if (!s->arm_ffa_forward ||
         !(run->hypercall.flags & KVM_HYPERCALL_EXIT_SMC) ||
         !kvm_arm_is_ffa_call(func_id)) {
         error_report("Unexpected Arm KVM hypercall exit: function 0x%" PRIx64
@@ -1636,6 +1637,10 @@ static int kvm_arm_handle_ffa_hypercall(CPUState *cs, struct kvm_run *run)
     }
 
     kvm_cpu_synchronize_state(cs);
+
+    if (s->arm_ffa_stub_delay_ms) {
+        g_usleep((gulong)s->arm_ffa_stub_delay_ms * 1000);
+    }
 
     if (is_a64(env)) {
         trace_kvm_arm_ffa_stub(cs->cpu_index, func_id,
@@ -1909,6 +1914,34 @@ static void kvm_arm_set_ffa_forward(Object *obj, bool value, Error **errp)
     s->arm_ffa_forward = value;
 }
 
+static void kvm_arm_get_ffa_stub_delay(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    KVMState *s = KVM_STATE(obj);
+    uint32_t value = s->arm_ffa_stub_delay_ms;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void kvm_arm_set_ffa_stub_delay(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    KVMState *s = KVM_STATE(obj);
+    uint32_t value;
+
+    if (s->fd != -1) {
+        error_setg(errp, "Unable to configure arm-ffa-stub-delay-ms after "
+                   "KVM has been initialized");
+        return;
+    }
+
+    if (visit_type_uint32(v, name, &value, errp)) {
+        s->arm_ffa_stub_delay_ms = value;
+    }
+}
+
 void kvm_arch_accel_class_init(ObjectClass *oc)
 {
     object_class_property_add(oc, "eager-split-size", "size",
@@ -1923,6 +1956,13 @@ void kvm_arch_accel_class_init(ObjectClass *oc)
                                    kvm_arm_set_ffa_forward);
     object_class_property_set_description(oc, "arm-ffa-forward",
         "Forward Arm FF-A SMC calls to userspace (default: off)");
+
+    object_class_property_add(oc, "arm-ffa-stub-delay-ms", "uint32",
+                              kvm_arm_get_ffa_stub_delay,
+                              kvm_arm_set_ffa_stub_delay, NULL, NULL);
+    object_class_property_set_description(oc, "arm-ffa-stub-delay-ms",
+        "Delay the Arm FF-A userspace stub for interrupt testing "
+        "(default: 0)");
 }
 
 int kvm_arch_insert_hw_breakpoint(vaddr addr, vaddr len, int type)
