@@ -105,6 +105,13 @@ static GlobalProperty arm_virt_compat_defaults[] = {
 static const size_t arm_virt_compat_defaults_len =
     G_N_ELEMENTS(arm_virt_compat_defaults);
 
+enum {
+    HYBRID_SHADOW_STAGE_SMOKE,
+    HYBRID_SHADOW_STAGE_BOOTSTRAP,
+    HYBRID_SHADOW_STAGE_READY,
+    HYBRID_SHADOW_STAGE_RUNTIME,
+};
+
 /*
  * This cannot be called from the virt_machine_class_init() because
  * TYPE_VIRT_MACHINE is abstract and mc->compat_props g_ptr_array_new()
@@ -2391,12 +2398,18 @@ static void create_secure_ram(VirtMachineState *vms,
     g_free(nodename);
 }
 
+static void virt_hybrid_runtime_execute(VirtMachineState *vms);
+
 static void virt_hybrid_shadow_execute(VirtMachineState *vms)
 {
     CPUState *cs = vms->hybrid_shadow_cpu;
     ARMCPU *cpu = ARM_CPU(cs);
-    AddressSpace *as = cpu_get_address_space(cs, ARMASIdx_S);
     int ret;
+
+    if (vms->hybrid_shadow_stage == HYBRID_SHADOW_STAGE_RUNTIME) {
+        virt_hybrid_runtime_execute(vms);
+        return;
+    }
 
     cs->stopped = false;
     cs->halted = false;
@@ -2404,19 +2417,11 @@ static void virt_hybrid_shadow_execute(VirtMachineState *vms)
     vms->hybrid_shadow_stop_reason = ret;
     vms->hybrid_shadow_smoke_x0 = cpu->env.xregs[0];
     vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
-    if (vms->hybrid_shadow_stage == 1) {
+    if (vms->hybrid_shadow_stage == HYBRID_SHADOW_STAGE_BOOTSTRAP) {
         uint64_t bl33_xregs[ARRAY_SIZE(cpu->env.xregs)];
         uint64_t bl33_pstate;
         uint64_t bl33_sp_el2;
         uint64_t bl33_elr_el2;
-        uint32_t saved_code[2];
-        uint32_t direct_code[] = {
-            cpu_to_le32(0xd4000003), /* smc #0 */
-            cpu_to_le32(0xd503201f), /* nop */
-        };
-        MemTxResult result;
-        bool code_patched = false;
-        bool return_breakpoint = false;
 
         vms->hybrid_shadow_bootstrap_passed =
             ret == EXCP_DEBUG && vms->hybrid_shadow_stop_pc == 0x04000000;
@@ -2429,19 +2434,6 @@ static void virt_hybrid_shadow_execute(VirtMachineState *vms)
         bl33_pstate = pstate_read(&cpu->env);
         bl33_sp_el2 = cpu->env.sp_el[2];
         bl33_elr_el2 = cpu->env.elr_el[2];
-        result = address_space_read(as, 0x40100000,
-                                    MEMTXATTRS_UNSPECIFIED,
-                                    saved_code, sizeof(saved_code));
-        if (result != MEMTX_OK) {
-            goto out;
-        }
-        code_patched = true;
-        result = address_space_write(as, 0x40100000,
-                                     MEMTXATTRS_UNSPECIFIED,
-                                     direct_code, sizeof(direct_code));
-        if (result != MEMTX_OK) {
-            goto direct_cleanup;
-        }
 
         memset(cpu->env.xregs, 0, sizeof(bl33_xregs));
         cpu->env.xregs[0] = 0xc400008d;
@@ -2449,16 +2441,12 @@ static void virt_hybrid_shadow_execute(VirtMachineState *vms)
         cpu->env.xregs[2] = 0xaf4f0618a462b817;
         cpu->env.xregs[3] = 0x613835589a08b386;
         cpu->env.xregs[4] = 0x0f000001;
-        cpu_set_pc(cs, 0x40100000);
+        cpu_set_pc(cs, vms->hybrid_trampoline_addr);
         arm_rebuild_hflags(&cpu->env);
         cs->exception_index = -1;
         cs->halted = false;
-        if (cpu_breakpoint_insert(cs, 0x40100004, BP_GDB, NULL)) {
-            goto direct_cleanup;
-        }
-        return_breakpoint = true;
 
-        vms->hybrid_shadow_stage = 2;
+        vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_READY;
         ret = tcg_secondary_cpu_exec(cs);
         vms->hybrid_shadow_stop_reason = ret;
         vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
@@ -2466,28 +2454,13 @@ static void virt_hybrid_shadow_execute(VirtMachineState *vms)
         vms->hybrid_shadow_direct_x4 = cpu->env.xregs[4];
         vms->hybrid_shadow_direct_x5 = cpu->env.xregs[5];
         vms->hybrid_shadow_direct_passed =
-            ret == EXCP_DEBUG &&
-            vms->hybrid_shadow_stop_pc == 0x40100004 &&
+            ret == EXCP_HLT &&
             cpu->env.xregs[0] == 0xc400008e &&
             cpu->env.xregs[1] == 0x80020000 &&
             (cpu->env.xregs[4] == UINT64_MAX ||
              (cpu->env.xregs[4] == 0x05000002 &&
               cpu->env.xregs[5] == 0x00010000));
 
-direct_cleanup:
-        if (return_breakpoint) {
-            cpu_breakpoint_remove(cs, 0x40100004, BP_GDB);
-        }
-        if (code_patched) {
-            result = address_space_write(as, 0x40100000,
-                                         MEMTXATTRS_UNSPECIFIED,
-                                         saved_code, sizeof(saved_code));
-            if (result != MEMTX_OK) {
-                vms->hybrid_shadow_direct_passed = false;
-                error_report("mach-virt: failed to restore hybrid direct "
-                             "request smoke code");
-            }
-        }
         memcpy(cpu->env.xregs, bl33_xregs, sizeof(bl33_xregs));
         pstate_write(&cpu->env, bl33_pstate);
         cpu->env.sp_el[2] = bl33_sp_el2;
@@ -2518,6 +2491,10 @@ static void *virt_hybrid_shadow_worker(void *opaque)
         }
 
         if (vms->hybrid_shadow_worker_stop) {
+            vms->hybrid_runtime_result = -ECANCELED;
+            vms->hybrid_shadow_worker_done = true;
+            vms->hybrid_runtime_inflight = false;
+            qemu_cond_broadcast(&vms->hybrid_shadow_cond);
             break;
         }
 
@@ -2531,6 +2508,46 @@ static void *virt_hybrid_shadow_worker(void *opaque)
     qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
     tcg_secondary_cpu_thread_destroy();
     return NULL;
+}
+
+static void virt_hybrid_runtime_execute(VirtMachineState *vms)
+{
+    CPUState *cs = vms->hybrid_shadow_cpu;
+    ARMCPU *cpu = ARM_CPU(cs);
+    uint64_t saved_xregs[ARRAY_SIZE(cpu->env.xregs)];
+    uint64_t saved_pstate = pstate_read(&cpu->env);
+    uint64_t saved_sp_el2 = cpu->env.sp_el[2];
+    uint64_t saved_elr_el2 = cpu->env.elr_el[2];
+    uint64_t saved_pc = cs->cc->get_pc(cs);
+    int ret;
+
+    memcpy(saved_xregs, cpu->env.xregs, sizeof(saved_xregs));
+    memcpy(cpu->env.xregs, vms->hybrid_runtime_regs,
+           sizeof(vms->hybrid_runtime_regs));
+    cpu_set_pc(cs, vms->hybrid_trampoline_addr);
+    arm_rebuild_hflags(&cpu->env);
+    cs->exception_index = -1;
+    cs->halted = false;
+
+    ret = tcg_secondary_cpu_exec(cs);
+    vms->hybrid_shadow_stop_reason = ret;
+    vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
+    if (ret == EXCP_HLT) {
+        memcpy(vms->hybrid_runtime_regs, cpu->env.xregs,
+               sizeof(vms->hybrid_runtime_regs));
+        vms->hybrid_runtime_result = 0;
+    } else {
+        vms->hybrid_runtime_result = -EIO;
+    }
+
+    memcpy(cpu->env.xregs, saved_xregs, sizeof(saved_xregs));
+    pstate_write(&cpu->env, saved_pstate);
+    cpu->env.sp_el[2] = saved_sp_el2;
+    cpu->env.elr_el[2] = saved_elr_el2;
+    cpu_set_pc(cs, saved_pc);
+    arm_rebuild_hflags(&cpu->env);
+    cs->exception_index = -1;
+    cs->halted = false;
 }
 
 static void virt_hybrid_shadow_run_worker(VirtMachineState *vms)
@@ -2555,6 +2572,103 @@ static void virt_hybrid_shadow_run_worker(VirtMachineState *vms)
     }
     qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
     bql_lock();
+}
+
+int arm_hybrid_ffa_call(uint64_t regs[18])
+{
+    VirtMachineState *vms;
+    int ret;
+
+    if (!current_machine ||
+        !object_dynamic_cast(OBJECT(current_machine), TYPE_VIRT_MACHINE)) {
+        return -ENOTSUP;
+    }
+
+    vms = VIRT_MACHINE(current_machine);
+    if (!vms->hybrid_secure || !vms->hybrid_shadow_worker_created) {
+        return -ENOTSUP;
+    }
+    if (qemu_mutex_trylock(&vms->hybrid_shadow_mutex)) {
+        return -EBUSY;
+    }
+    if (vms->hybrid_runtime_inflight ||
+        !vms->hybrid_shadow_worker_alive) {
+        qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+        return -EBUSY;
+    }
+    if (vms->hybrid_shadow_stage != HYBRID_SHADOW_STAGE_READY) {
+        qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+        return -ENOTSUP;
+    }
+
+    vms->hybrid_runtime_inflight = true;
+    memcpy(vms->hybrid_runtime_regs, regs,
+           sizeof(vms->hybrid_runtime_regs));
+    vms->hybrid_runtime_result = -EINPROGRESS;
+    vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_RUNTIME;
+    vms->hybrid_shadow_worker_done = false;
+    vms->hybrid_shadow_worker_request = true;
+    qemu_cond_signal(&vms->hybrid_shadow_cond);
+
+    while (!vms->hybrid_shadow_worker_done) {
+        qemu_cond_wait(&vms->hybrid_shadow_cond,
+                       &vms->hybrid_shadow_mutex);
+    }
+
+    ret = vms->hybrid_runtime_result;
+    if (!ret) {
+        memcpy(regs, vms->hybrid_runtime_regs,
+               sizeof(vms->hybrid_runtime_regs));
+    }
+    vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_READY;
+    vms->hybrid_runtime_inflight = false;
+    qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+    return ret;
+}
+
+static void virt_hybrid_verify_shared_crb(VirtMachineState *vms)
+{
+    static const hwaddr crb_base = 0x40200000;
+    static const uint64_t marker = UINT64_C(0x4352425348415245);
+    AddressSpace *shadow_as =
+        cpu_get_address_space(vms->hybrid_shadow_cpu, ARMASIdx_NS);
+    uint64_t saved = 0;
+    uint64_t observed = 0;
+    MemTxResult read_result;
+    MemTxResult write_result;
+    MemTxResult shadow_result;
+    MemTxResult restore_result = MEMTX_OK;
+
+    read_result = address_space_read(&address_space_memory, crb_base,
+                                     MEMTXATTRS_UNSPECIFIED,
+                                     &saved, sizeof(saved));
+    write_result = MEMTX_DECODE_ERROR;
+    shadow_result = MEMTX_DECODE_ERROR;
+    if (read_result == MEMTX_OK) {
+        write_result = address_space_write(&address_space_memory, crb_base,
+                                           MEMTXATTRS_UNSPECIFIED,
+                                           &marker, sizeof(marker));
+    }
+    if (write_result == MEMTX_OK) {
+        shadow_result = address_space_read(shadow_as, crb_base,
+                                           MEMTXATTRS_UNSPECIFIED,
+                                           &observed, sizeof(observed));
+    }
+    if (write_result == MEMTX_OK) {
+        restore_result = address_space_write(&address_space_memory, crb_base,
+                                             MEMTXATTRS_UNSPECIFIED,
+                                             &saved, sizeof(saved));
+    }
+
+    vms->hybrid_shared_crb_verified =
+        read_result == MEMTX_OK && write_result == MEMTX_OK &&
+        shadow_result == MEMTX_OK && restore_result == MEMTX_OK &&
+        observed == marker;
+    if (!vms->hybrid_shared_crb_verified) {
+        error_report("mach-virt: internal CRB is not shared with the shadow "
+                     "normal address space");
+        exit(1);
+    }
 }
 
 static void virt_hybrid_kvm_handoff_reset(void *opaque)
@@ -2613,7 +2727,7 @@ static void virt_hybrid_shadow_boot(VirtMachineState *vms,
     MemTxResult result;
 
     if (firmware_loaded) {
-        vms->hybrid_shadow_stage = 1;
+        vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_BOOTSTRAP;
         if (cpu_breakpoint_insert(cs, 0x04000000, BP_GDB, NULL)) {
             error_report("mach-virt: failed to set hybrid BL33 boundary");
             exit(1);
@@ -2650,7 +2764,7 @@ static void virt_hybrid_shadow_boot(VirtMachineState *vms,
         return;
     }
 
-    vms->hybrid_shadow_stage = 0;
+    vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_SMOKE;
 
     for (size_t i = 0; i < ARRAY_SIZE(code); i++) {
         code[i] = cpu_to_le32(code[i]);
@@ -3294,6 +3408,26 @@ static void machvirt_init(MachineState *machine)
     }
 
     if (vms->hybrid_secure) {
+        static const uint32_t trampoline_code[] = {
+            0xd4000003, /* smc #0 */
+            0xd503207f, /* wfi */
+        };
+        MemoryRegion *trampoline = g_new(MemoryRegion, 1);
+        uint32_t *code;
+
+        memory_region_init_ram(trampoline, NULL,
+                               "hybrid-smc-trampoline", 4 * KiB,
+                               &error_fatal);
+        code = memory_region_get_ram_ptr(trampoline);
+        for (size_t i = 0; i < ARRAY_SIZE(trampoline_code); i++) {
+            code[i] = cpu_to_le32(trampoline_code[i]);
+        }
+        memory_region_set_readonly(trampoline, true);
+        memory_region_add_subregion(sysmem, 0x0b000000, trampoline);
+
+        vms->hybrid_smc_trampoline = trampoline;
+        vms->hybrid_trampoline_addr = 0x0b000000;
+
         tag_sysmem = g_new(MemoryRegion, 1);
         memory_region_init(tag_sysmem, OBJECT(machine),
                            "hybrid-tag-memory", UINT64_MAX / 32);
@@ -3547,6 +3681,10 @@ static void machvirt_init(MachineState *machine)
     memory_region_add_subregion(sysmem, vms->memmap[VIRT_MEM].base,
                                 machine->ram);
 
+    if (vms->hybrid_secure) {
+        virt_hybrid_verify_shared_crb(vms);
+    }
+
     cxl_fmws_update_mmio();
 
     virt_flash_fdt(vms, sysmem, secure_sysmem ?: sysmem);
@@ -3771,6 +3909,13 @@ static bool virt_get_hybrid_kvm_handoff_ready(Object *obj, Error **errp)
     VirtMachineState *vms = VIRT_MACHINE(obj);
 
     return vms->hybrid_kvm_handoff_ready;
+}
+
+static bool virt_get_hybrid_shared_crb_verified(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    return vms->hybrid_shared_crb_verified;
 }
 
 static bool virt_get_hybrid_shadow_worker_alive(Object *obj, Error **errp)
@@ -4354,6 +4499,18 @@ static void virt_machine_device_pre_plug_cb(HotplugHandler *hotplug_dev,
 
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
         virt_memory_pre_plug(hotplug_dev, dev, errp);
+    } else if (object_dynamic_cast(OBJECT(dev), TYPE_TPM_CRB)) {
+        if (!vms->hybrid_secure) {
+            error_setg(errp, "virt: tpm-crb requires hybrid-secure=on");
+            return;
+        }
+        object_property_set_link(OBJECT(dev), "x-memory",
+                                 OBJECT(vms->secure_sysmem), errp);
+        if (*errp) {
+            return;
+        }
+        object_property_set_uint(OBJECT(dev), "x-base-addr", 0x0c000000,
+                                 errp);
     } else if (object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_MD_PCI)) {
         virtio_md_pci_pre_plug(VIRTIO_MD_PCI(dev), MACHINE(hotplug_dev), errp);
     } else if (object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_IOMMU_PCI)) {
@@ -4443,7 +4600,8 @@ static void virt_machine_device_plug_cb(HotplugHandler *hotplug_dev,
 {
     VirtMachineState *vms = VIRT_MACHINE(hotplug_dev);
 
-    if (vms->platform_bus_dev) {
+    if (vms->platform_bus_dev &&
+        !object_dynamic_cast(OBJECT(dev), TYPE_TPM_CRB)) {
         MachineClass *mc = MACHINE_GET_CLASS(vms);
 
         if (device_is_dynamic_sysbus(mc, dev)) {
@@ -4555,6 +4713,7 @@ static HotplugHandler *virt_machine_get_hotplug_handler(MachineState *machine,
     MachineClass *mc = MACHINE_GET_CLASS(machine);
 
     if (device_is_dynamic_sysbus(mc, dev) ||
+        object_dynamic_cast(OBJECT(dev), TYPE_TPM_CRB) ||
         object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM) ||
         object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_MD_PCI) ||
         object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_IOMMU_PCI)) {
@@ -4788,6 +4947,11 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                    virt_get_hybrid_kvm_handoff_ready, NULL);
     object_class_property_set_description(oc, "hybrid-kvm-handoff-ready",
         "Whether BL33 entry state was transferred to KVM CPU0");
+
+    object_class_property_add_bool(oc, "hybrid-shared-crb-verified",
+                                   virt_get_hybrid_shared_crb_verified, NULL);
+    object_class_property_set_description(oc, "hybrid-shared-crb-verified",
+        "Whether the internal CRB RAM is shared with the shadow normal view");
 
     object_class_property_add_bool(oc, "hybrid-shadow-worker-alive",
                                    virt_get_hybrid_shadow_worker_alive, NULL);

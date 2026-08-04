@@ -223,15 +223,17 @@ static void acpi_dsdt_add_gpio(Aml *scope, const MemMapEntry *gpio_memmap,
 #ifdef CONFIG_TPM
 static void acpi_dsdt_add_tpm(Aml *scope, VirtMachineState *vms)
 {
+    TPMIf *tpm = tpm_find();
     PlatformBusDevice *pbus = PLATFORM_BUS_DEVICE(vms->platform_bus_dev);
     hwaddr pbus_base = vms->memmap[VIRT_PLATFORM_BUS].base;
-    SysBusDevice *sbdev = SYS_BUS_DEVICE(tpm_find());
+    SysBusDevice *sbdev;
     MemoryRegion *sbdev_mr;
     hwaddr tpm_base;
 
-    if (!sbdev) {
+    if (!tpm || !object_dynamic_cast(OBJECT(tpm), TYPE_SYS_BUS_DEVICE)) {
         return;
     }
+    sbdev = SYS_BUS_DEVICE(tpm);
 
     tpm_base = platform_bus_get_mmio_addr(pbus, sbdev, 0);
     assert(tpm_base != -1);

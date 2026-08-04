@@ -50,6 +50,8 @@ struct CRBState {
 
     TPMPPI ppi;
 
+    MemoryRegion *memory;
+    uint64_t base_addr;
     bool cap_chunk;
     bool allow_chunk_migration;
     Error *migration_blocker;
@@ -411,6 +413,10 @@ static const VMStateDescription vmstate_tpm_crb = {
 
 static const Property tpm_crb_properties[] = {
     DEFINE_PROP_TPMBE("tpmdev", CRBState, tpmbe),
+    DEFINE_PROP_LINK("x-memory", CRBState, memory, TYPE_MEMORY_REGION,
+                     MemoryRegion *),
+    DEFINE_PROP_UINT64("x-base-addr", CRBState, base_addr,
+                       TPM_CRB_ADDR_BASE),
     DEFINE_PROP_BOOL("cap-chunk", CRBState, cap_chunk, true),
     DEFINE_PROP_BOOL("x-allow-chunk-migration", CRBState,
                      allow_chunk_migration, true),
@@ -454,9 +460,9 @@ static void tpm_crb_reset(void *dev)
                      VID, PCI_VENDOR_ID_IBM);
 
     s->regs[R_CRB_CTRL_CMD_SIZE] = CRB_CTRL_CMD_SIZE;
-    s->regs[R_CRB_CTRL_CMD_LADDR] = TPM_CRB_ADDR_BASE + A_CRB_DATA_BUFFER;
+    s->regs[R_CRB_CTRL_CMD_LADDR] = s->base_addr + A_CRB_DATA_BUFFER;
     s->regs[R_CRB_CTRL_RSP_SIZE] = CRB_CTRL_CMD_SIZE;
-    s->regs[R_CRB_CTRL_RSP_ADDR] = TPM_CRB_ADDR_BASE + A_CRB_DATA_BUFFER;
+    s->regs[R_CRB_CTRL_RSP_ADDR] = s->base_addr + A_CRB_DATA_BUFFER;
 
     s->be_buffer_size = tpm_backend_get_buffer_size(s->tpmbe);
 
@@ -468,6 +474,7 @@ static void tpm_crb_reset(void *dev)
 static void tpm_crb_realize(DeviceState *dev, Error **errp)
 {
     CRBState *s = CRB(dev);
+    MemoryRegion *memory = s->memory ?: get_system_memory();
     int ret;
 
     if (!tpm_find()) {
@@ -476,6 +483,10 @@ static void tpm_crb_realize(DeviceState *dev, Error **errp)
     }
     if (!s->tpmbe) {
         error_setg(errp, "'tpmdev' property is required");
+        return;
+    }
+    if (s->base_addr > UINT32_MAX - A_CRB_DATA_BUFFER) {
+        error_setg(errp, "tpm-crb x-base-addr must fit in 32 bits");
         return;
     }
     if (s->cap_chunk && !s->allow_chunk_migration) {
@@ -493,16 +504,14 @@ static void tpm_crb_realize(DeviceState *dev, Error **errp)
     memory_region_init_ram(&s->cmdmem, OBJECT(s),
         "tpm-crb-cmd", CRB_CTRL_CMD_SIZE, errp);
 
-    memory_region_add_subregion(get_system_memory(),
-        TPM_CRB_ADDR_BASE, &s->mmio);
-    memory_region_add_subregion(get_system_memory(),
-        TPM_CRB_ADDR_BASE + sizeof(s->regs), &s->cmdmem);
+    memory_region_add_subregion(memory, s->base_addr, &s->mmio);
+    memory_region_add_subregion(memory,
+        s->base_addr + sizeof(s->regs), &s->cmdmem);
 
     s->command_buffer = g_byte_array_new();
     s->response_buffer = g_byte_array_new();
 
-    tpm_ppi_init(&s->ppi, get_system_memory(),
-                 TPM_PPI_ADDR_BASE, OBJECT(s));
+    tpm_ppi_init(&s->ppi, memory, TPM_PPI_ADDR_BASE, OBJECT(s));
 
     if (xen_enabled()) {
         tpm_crb_reset(dev);

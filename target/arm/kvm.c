@@ -58,6 +58,8 @@ static bool cap_has_inject_ext_dabt;
 #define KVM_ARM_FFA_SMC64_BASE 0xc4000000
 #define KVM_ARM_FFA_ERROR 0x84000060
 #define KVM_ARM_FFA_NOT_SUPPORTED UINT32_MAX
+#define KVM_ARM_FFA_BUSY (UINT32_MAX - 3)
+#define KVM_ARM_FFA_ABORTED (UINT32_MAX - 7)
 
 /**
  * ARMHostCPUFeatures: information about the host CPU (identified
@@ -1643,11 +1645,28 @@ static int kvm_arm_handle_ffa_hypercall(CPUState *cs, struct kvm_run *run)
     }
 
     if (is_a64(env)) {
+        uint64_t regs[18];
+        int hybrid_ret;
+
         trace_kvm_arm_ffa_stub(cs->cpu_index, func_id,
                                env->xregs[1], env->xregs[2]);
-        memset(env->xregs, 0, 18 * sizeof(env->xregs[0]));
-        env->xregs[0] = KVM_ARM_FFA_ERROR;
-        env->xregs[2] = KVM_ARM_FFA_NOT_SUPPORTED;
+        memcpy(regs, env->xregs, sizeof(regs));
+        hybrid_ret = arm_hybrid_ffa_call(regs);
+        if (!hybrid_ret) {
+            memcpy(env->xregs, regs, sizeof(regs));
+        } else {
+            memset(env->xregs, 0, 18 * sizeof(env->xregs[0]));
+            env->xregs[0] = KVM_ARM_FFA_ERROR;
+            if (hybrid_ret == -EBUSY) {
+                env->xregs[2] = KVM_ARM_FFA_BUSY;
+            } else if (hybrid_ret == -ENOTSUP) {
+                env->xregs[2] = KVM_ARM_FFA_NOT_SUPPORTED;
+            } else {
+                error_report("Arm hybrid FF-A call failed on CPU %d: %s",
+                             cs->cpu_index, strerror(-hybrid_ret));
+                env->xregs[2] = KVM_ARM_FFA_ABORTED;
+            }
+        }
     } else {
         trace_kvm_arm_ffa_stub(cs->cpu_index, func_id,
                                env->regs[1], env->regs[2]);
@@ -1657,7 +1676,7 @@ static int kvm_arm_handle_ffa_hypercall(CPUState *cs, struct kvm_run *run)
         env->regs[3] = 0;
     }
 
-    run->hypercall.ret = KVM_ARM_FFA_ERROR;
+    run->hypercall.ret = is_a64(env) ? env->xregs[0] : env->regs[0];
     return 0;
 }
 
