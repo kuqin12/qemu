@@ -39,7 +39,7 @@ printf '%s\n' \
         -qmp stdio >"$qmp_log"
 
 true_count=$(grep -cF '{"return": true}' "$qmp_log" || true)
-stop_count=$(grep -cF '{"return": 1074790404}' "$qmp_log" || true)
+stop_count=$(grep -cF '{"return": 184549384}' "$qmp_log" || true)
 current_count=$(grep -cF '{"return": 67108864}' "$qmp_log" || true)
 cpu_count=$(grep -o '"qom-type": "host-arm-cpu"' "$qmp_log" | wc -l)
 bootstrap_count=$(grep -c 'Finished bootstrapping all SPs on CPU0' "$normal_log" || true)
