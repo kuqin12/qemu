@@ -52,6 +52,13 @@ static bool cap_has_mp_state;
 static bool cap_has_inject_serror_esr;
 static bool cap_has_inject_ext_dabt;
 
+#define KVM_ARM_FFA_FNUM_MIN 0x60
+#define KVM_ARM_FFA_FNUM_MAX 0x8e
+#define KVM_ARM_FFA_SMC32_BASE 0x84000000
+#define KVM_ARM_FFA_SMC64_BASE 0xc4000000
+#define KVM_ARM_FFA_ERROR 0x84000060
+#define KVM_ARM_FFA_NOT_SUPPORTED UINT32_MAX
+
 /**
  * ARMHostCPUFeatures: information about the host CPU (identified
  * by asking the host kernel)
@@ -594,6 +601,47 @@ int kvm_arch_get_default_type(MachineState *ms)
     return fixed_ipa ? 0 : size;
 }
 
+static int kvm_arm_set_ffa_filter(KVMState *s, uint32_t base)
+{
+    struct kvm_smccc_filter filter = {
+        .base = base | KVM_ARM_FFA_FNUM_MIN,
+        .nr_functions = KVM_ARM_FFA_FNUM_MAX - KVM_ARM_FFA_FNUM_MIN + 1,
+        .action = KVM_SMCCC_FILTER_FWD_TO_USER,
+    };
+    struct kvm_device_attr attr = {
+        .group = KVM_ARM_VM_SMCCC_CTRL,
+        .attr = KVM_ARM_VM_SMCCC_FILTER,
+        .addr = (uintptr_t)&filter,
+    };
+
+    return kvm_vm_ioctl(s, KVM_SET_DEVICE_ATTR, &attr);
+}
+
+static int kvm_arm_init_ffa_forwarding(KVMState *s)
+{
+    int ret;
+
+    if (!kvm_vm_check_attr(s, KVM_ARM_VM_SMCCC_CTRL,
+                           KVM_ARM_VM_SMCCC_FILTER)) {
+        error_report("KVM does not support Arm SMCCC userspace filters");
+        return -ENOTSUP;
+    }
+
+    ret = kvm_arm_set_ffa_filter(s, KVM_ARM_FFA_SMC32_BASE);
+    if (ret) {
+        error_report("Failed to install KVM FF-A SMC32 filter: %s",
+                     strerror(-ret));
+        return ret;
+    }
+
+    ret = kvm_arm_set_ffa_filter(s, KVM_ARM_FFA_SMC64_BASE);
+    if (ret) {
+        error_report("Failed to install KVM FF-A SMC64 filter: %s",
+                     strerror(-ret));
+    }
+    return ret;
+}
+
 int kvm_arch_init(MachineState *ms, KVMState *s)
 {
     int ret = 0;
@@ -613,6 +661,13 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
     /* Check whether user space can specify guest syndrome value */
     cap_has_inject_serror_esr =
         kvm_check_extension(s, KVM_CAP_ARM_INJECT_SERROR_ESR);
+
+    if (s->arm_ffa_forward) {
+        ret = kvm_arm_init_ffa_forwarding(s);
+        if (ret) {
+            return ret;
+        }
+    }
 
     if (ms->smp.cpus > 256 &&
         !kvm_check_extension(s, KVM_CAP_ARM_IRQ_LINE_LAYOUT_2)) {
@@ -1544,6 +1599,56 @@ static bool kvm_arm_handle_debug(ARMCPU *cpu,
     return false;
 }
 
+static bool kvm_arm_is_ffa_call(uint64_t func_id)
+{
+    uint32_t id = func_id;
+    uint32_t prefix = id & 0xffff0000;
+    uint32_t func_num = id & 0xffff;
+
+    if (func_id != id) {
+        return false;
+    }
+
+    return (prefix == KVM_ARM_FFA_SMC32_BASE ||
+            prefix == KVM_ARM_FFA_SMC64_BASE) &&
+           func_num >= KVM_ARM_FFA_FNUM_MIN &&
+           func_num <= KVM_ARM_FFA_FNUM_MAX;
+}
+
+static int kvm_arm_handle_ffa_hypercall(CPUState *cs, struct kvm_run *run)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+    CPUARMState *env = &cpu->env;
+    uint64_t func_id = run->hypercall.nr;
+
+    if (!cs->kvm_state->arm_ffa_forward ||
+        !(run->hypercall.flags & KVM_HYPERCALL_EXIT_SMC) ||
+        !kvm_arm_is_ffa_call(func_id)) {
+        error_report("Unexpected Arm KVM hypercall exit: function 0x%" PRIx64
+                     ", flags 0x%" PRIx64, func_id, run->hypercall.flags);
+        return -EINVAL;
+    }
+
+    kvm_cpu_synchronize_state(cs);
+
+    if (is_a64(env)) {
+        trace_kvm_arm_ffa_stub(cs->cpu_index, func_id,
+                               env->xregs[1], env->xregs[2]);
+        memset(env->xregs, 0, 18 * sizeof(env->xregs[0]));
+        env->xregs[0] = KVM_ARM_FFA_ERROR;
+        env->xregs[2] = KVM_ARM_FFA_NOT_SUPPORTED;
+    } else {
+        trace_kvm_arm_ffa_stub(cs->cpu_index, func_id,
+                               env->regs[1], env->regs[2]);
+        memset(env->regs, 0, 4 * sizeof(env->regs[0]));
+        env->regs[0] = KVM_ARM_FFA_ERROR;
+        env->regs[2] = KVM_ARM_FFA_NOT_SUPPORTED;
+    }
+
+    run->hypercall.ret = KVM_ARM_FFA_ERROR;
+    return 0;
+}
+
 int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
 {
     ARMCPU *cpu = ARM_CPU(cs);
@@ -1559,6 +1664,9 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
         /* External DABT with no valid iss to decode */
         ret = kvm_arm_handle_dabt_nisv(cpu, run->arm_nisv.esr_iss,
                                        run->arm_nisv.fault_ipa);
+        break;
+    case KVM_EXIT_HYPERCALL:
+        ret = kvm_arm_handle_ffa_hypercall(cs, run);
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "%s: un-handled exit reason %d\n",
@@ -1774,6 +1882,26 @@ static void kvm_arch_set_eager_split_size(Object *obj, Visitor *v,
     s->kvm_eager_split_size = value;
 }
 
+static bool kvm_arm_get_ffa_forward(Object *obj, Error **errp)
+{
+    KVMState *s = KVM_STATE(obj);
+
+    return s->arm_ffa_forward;
+}
+
+static void kvm_arm_set_ffa_forward(Object *obj, bool value, Error **errp)
+{
+    KVMState *s = KVM_STATE(obj);
+
+    if (s->fd != -1) {
+        error_setg(errp, "Unable to configure arm-ffa-forward after KVM "
+                   "has been initialized");
+        return;
+    }
+
+    s->arm_ffa_forward = value;
+}
+
 void kvm_arch_accel_class_init(ObjectClass *oc)
 {
     object_class_property_add(oc, "eager-split-size", "size",
@@ -1782,6 +1910,12 @@ void kvm_arch_accel_class_init(ObjectClass *oc)
 
     object_class_property_set_description(oc, "eager-split-size",
         "Eager Page Split chunk size for hugepages. (default: 0, disabled)");
+
+    object_class_property_add_bool(oc, "arm-ffa-forward",
+                                   kvm_arm_get_ffa_forward,
+                                   kvm_arm_set_ffa_forward);
+    object_class_property_set_description(oc, "arm-ffa-forward",
+        "Forward Arm FF-A SMC calls to userspace (default: off)");
 }
 
 int kvm_arch_insert_hw_breakpoint(vaddr addr, vaddr len, int type)
