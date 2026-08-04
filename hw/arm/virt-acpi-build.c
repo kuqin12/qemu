@@ -223,17 +223,19 @@ static void acpi_dsdt_add_gpio(Aml *scope, const MemMapEntry *gpio_memmap,
 #ifdef CONFIG_TPM
 static void acpi_dsdt_add_tpm(Aml *scope, VirtMachineState *vms)
 {
-    TPMIf *tpm = tpm_find();
+    if (vms->hybrid_secure) {
+        return;
+    }
+
     PlatformBusDevice *pbus = PLATFORM_BUS_DEVICE(vms->platform_bus_dev);
     hwaddr pbus_base = vms->memmap[VIRT_PLATFORM_BUS].base;
-    SysBusDevice *sbdev;
+    SysBusDevice *sbdev = SYS_BUS_DEVICE(tpm_find());
     MemoryRegion *sbdev_mr;
     hwaddr tpm_base;
 
-    if (!tpm || !object_dynamic_cast(OBJECT(tpm), TYPE_SYS_BUS_DEVICE)) {
+    if (!sbdev) {
         return;
     }
-    sbdev = SYS_BUS_DEVICE(tpm);
 
     tpm_base = platform_bus_get_mmio_addr(pbus, sbdev, 0);
     assert(tpm_base != -1);
@@ -1418,7 +1420,8 @@ void virt_acpi_build(VirtMachineState *vms, AcpiBuildTables *tables)
     build_iort(tables_blob, tables->linker, vms);
 
 #ifdef CONFIG_TPM
-    if (tpm_get_version(tpm_find()) == TPM_VERSION_2_0) {
+    if (!vms->hybrid_secure &&
+        tpm_get_version(tpm_find()) == TPM_VERSION_2_0) {
         acpi_add_table(table_offsets, tables_blob);
         build_tpm2(tables_blob, tables->linker, tables->tcpalog, vms->oem_id,
                    vms->oem_table_id);

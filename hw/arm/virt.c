@@ -2358,6 +2358,30 @@ static void create_platform_bus(VirtMachineState *vms)
     memory_region_add_subregion(sysmem,
                                 vms->memmap[VIRT_PLATFORM_BUS].base,
                                 sysbus_mmio_get_region(s, 0));
+
+    if (vms->hybrid_secure) {
+        DeviceState *secure_dev = qdev_new(TYPE_PLATFORM_BUS_DEVICE);
+        SysBusDevice *secure_s;
+
+        secure_dev->id = g_strdup("hybrid-secure-platform-bus");
+        qdev_prop_set_uint32(secure_dev, "num_irqs", PLATFORM_BUS_NUM_IRQS);
+        qdev_prop_set_uint32(secure_dev, "mmio_size",
+                             vms->memmap[VIRT_PLATFORM_BUS].size);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(secure_dev), &error_fatal);
+        vms->hybrid_secure_platform_bus_dev = secure_dev;
+
+        secure_s = SYS_BUS_DEVICE(secure_dev);
+        for (i = 0; i < PLATFORM_BUS_NUM_IRQS; i++) {
+            int irq = vms->irqmap[VIRT_PLATFORM_BUS] + i;
+
+            sysbus_connect_irq(secure_s, i,
+                               qdev_get_gpio_in(vms->hybrid_secure_gic, irq));
+        }
+
+        memory_region_add_subregion_overlap(
+            vms->secure_sysmem, vms->memmap[VIRT_PLATFORM_BUS].base,
+            sysbus_mmio_get_region(secure_s, 0), 1);
+    }
 }
 
 static void create_tag_ram(MemoryRegion *tag_sysmem,
@@ -2624,51 +2648,6 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
     vms->hybrid_runtime_inflight = false;
     qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
     return ret;
-}
-
-static void virt_hybrid_verify_shared_crb(VirtMachineState *vms)
-{
-    static const hwaddr crb_base = 0x40200000;
-    static const uint64_t marker = UINT64_C(0x4352425348415245);
-    AddressSpace *shadow_as =
-        cpu_get_address_space(vms->hybrid_shadow_cpu, ARMASIdx_NS);
-    uint64_t saved = 0;
-    uint64_t observed = 0;
-    MemTxResult read_result;
-    MemTxResult write_result;
-    MemTxResult shadow_result;
-    MemTxResult restore_result = MEMTX_OK;
-
-    read_result = address_space_read(&address_space_memory, crb_base,
-                                     MEMTXATTRS_UNSPECIFIED,
-                                     &saved, sizeof(saved));
-    write_result = MEMTX_DECODE_ERROR;
-    shadow_result = MEMTX_DECODE_ERROR;
-    if (read_result == MEMTX_OK) {
-        write_result = address_space_write(&address_space_memory, crb_base,
-                                           MEMTXATTRS_UNSPECIFIED,
-                                           &marker, sizeof(marker));
-    }
-    if (write_result == MEMTX_OK) {
-        shadow_result = address_space_read(shadow_as, crb_base,
-                                           MEMTXATTRS_UNSPECIFIED,
-                                           &observed, sizeof(observed));
-    }
-    if (write_result == MEMTX_OK) {
-        restore_result = address_space_write(&address_space_memory, crb_base,
-                                             MEMTXATTRS_UNSPECIFIED,
-                                             &saved, sizeof(saved));
-    }
-
-    vms->hybrid_shared_crb_verified =
-        read_result == MEMTX_OK && write_result == MEMTX_OK &&
-        shadow_result == MEMTX_OK && restore_result == MEMTX_OK &&
-        observed == marker;
-    if (!vms->hybrid_shared_crb_verified) {
-        error_report("mach-virt: internal CRB is not shared with the shadow "
-                     "normal address space");
-        exit(1);
-    }
 }
 
 static void virt_hybrid_kvm_handoff_reset(void *opaque)
@@ -3681,10 +3660,6 @@ static void machvirt_init(MachineState *machine)
     memory_region_add_subregion(sysmem, vms->memmap[VIRT_MEM].base,
                                 machine->ram);
 
-    if (vms->hybrid_secure) {
-        virt_hybrid_verify_shared_crb(vms);
-    }
-
     cxl_fmws_update_mmio();
 
     virt_flash_fdt(vms, sysmem, secure_sysmem ?: sysmem);
@@ -3909,13 +3884,6 @@ static bool virt_get_hybrid_kvm_handoff_ready(Object *obj, Error **errp)
     VirtMachineState *vms = VIRT_MACHINE(obj);
 
     return vms->hybrid_kvm_handoff_ready;
-}
-
-static bool virt_get_hybrid_shared_crb_verified(Object *obj, Error **errp)
-{
-    VirtMachineState *vms = VIRT_MACHINE(obj);
-
-    return vms->hybrid_shared_crb_verified;
 }
 
 static bool virt_get_hybrid_shadow_worker_alive(Object *obj, Error **errp)
@@ -4499,18 +4467,6 @@ static void virt_machine_device_pre_plug_cb(HotplugHandler *hotplug_dev,
 
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
         virt_memory_pre_plug(hotplug_dev, dev, errp);
-    } else if (object_dynamic_cast(OBJECT(dev), TYPE_TPM_CRB)) {
-        if (!vms->hybrid_secure) {
-            error_setg(errp, "virt: tpm-crb requires hybrid-secure=on");
-            return;
-        }
-        object_property_set_link(OBJECT(dev), "x-memory",
-                                 OBJECT(vms->secure_sysmem), errp);
-        if (*errp) {
-            return;
-        }
-        object_property_set_uint(OBJECT(dev), "x-base-addr", 0x0c000000,
-                                 errp);
     } else if (object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_MD_PCI)) {
         virtio_md_pci_pre_plug(VIRTIO_MD_PCI(dev), MACHINE(hotplug_dev), errp);
     } else if (object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_IOMMU_PCI)) {
@@ -4600,12 +4556,16 @@ static void virt_machine_device_plug_cb(HotplugHandler *hotplug_dev,
 {
     VirtMachineState *vms = VIRT_MACHINE(hotplug_dev);
 
-    if (vms->platform_bus_dev &&
-        !object_dynamic_cast(OBJECT(dev), TYPE_TPM_CRB)) {
+    if (vms->platform_bus_dev) {
         MachineClass *mc = MACHINE_GET_CLASS(vms);
 
         if (device_is_dynamic_sysbus(mc, dev)) {
-            platform_bus_link_device(PLATFORM_BUS_DEVICE(vms->platform_bus_dev),
+            DeviceState *platform_bus = vms->platform_bus_dev;
+
+            if (vms->hybrid_secure && TPM_IS_TIS_SYSBUS(dev)) {
+                platform_bus = vms->hybrid_secure_platform_bus_dev;
+            }
+            platform_bus_link_device(PLATFORM_BUS_DEVICE(platform_bus),
                                      SYS_BUS_DEVICE(dev));
         }
     }
@@ -4713,7 +4673,6 @@ static HotplugHandler *virt_machine_get_hotplug_handler(MachineState *machine,
     MachineClass *mc = MACHINE_GET_CLASS(machine);
 
     if (device_is_dynamic_sysbus(mc, dev) ||
-        object_dynamic_cast(OBJECT(dev), TYPE_TPM_CRB) ||
         object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM) ||
         object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_MD_PCI) ||
         object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_IOMMU_PCI)) {
@@ -4947,11 +4906,6 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                    virt_get_hybrid_kvm_handoff_ready, NULL);
     object_class_property_set_description(oc, "hybrid-kvm-handoff-ready",
         "Whether BL33 entry state was transferred to KVM CPU0");
-
-    object_class_property_add_bool(oc, "hybrid-shared-crb-verified",
-                                   virt_get_hybrid_shared_crb_verified, NULL);
-    object_class_property_set_description(oc, "hybrid-shared-crb-verified",
-        "Whether the internal CRB RAM is shared with the shadow normal view");
 
     object_class_property_add_bool(oc, "hybrid-shadow-worker-alive",
                                    virt_get_hybrid_shadow_worker_alive, NULL);

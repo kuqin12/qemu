@@ -169,7 +169,6 @@ struct VirtMachineState {
     bool hybrid_shadow_smoke_passed;
     bool hybrid_shadow_bootstrap_passed;
     bool hybrid_shadow_direct_passed;
-    bool hybrid_shared_crb_verified;
     bool hybrid_kvm_handoff_ready;
     bool hybrid_kvm_handoff_pending;
     bool hybrid_initial_reset_done;
@@ -223,6 +222,7 @@ struct VirtMachineState {
     hwaddr highest_gpa;
     DeviceState *gic;
     DeviceState *hybrid_secure_gic;
+    DeviceState *hybrid_secure_platform_bus_dev;
     CPUState *hybrid_shadow_cpu;
     QemuThread hybrid_shadow_thread;
     QemuMutex hybrid_shadow_mutex;
