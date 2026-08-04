@@ -619,12 +619,17 @@ static int kvm_arm_set_ffa_filter(KVMState *s, uint32_t base)
 
 static int kvm_arm_init_ffa_forwarding(KVMState *s)
 {
+    struct kvm_device_attr attr = {
+        .group = KVM_ARM_VM_SMCCC_CTRL,
+        .attr = KVM_ARM_VM_SMCCC_FILTER,
+    };
     int ret;
 
-    if (!kvm_vm_check_attr(s, KVM_ARM_VM_SMCCC_CTRL,
-                           KVM_ARM_VM_SMCCC_FILTER)) {
-        error_report("KVM does not support Arm SMCCC userspace filters");
-        return -ENOTSUP;
+    ret = kvm_vm_ioctl(s, KVM_HAS_DEVICE_ATTR, &attr);
+    if (ret) {
+        error_report("KVM does not support Arm SMCCC userspace filters: %s",
+                     strerror(-ret));
+        return ret;
     }
 
     ret = kvm_arm_set_ffa_filter(s, KVM_ARM_FFA_SMC32_BASE);
@@ -1625,7 +1630,8 @@ static int kvm_arm_handle_ffa_hypercall(CPUState *cs, struct kvm_run *run)
         !(run->hypercall.flags & KVM_HYPERCALL_EXIT_SMC) ||
         !kvm_arm_is_ffa_call(func_id)) {
         error_report("Unexpected Arm KVM hypercall exit: function 0x%" PRIx64
-                     ", flags 0x%" PRIx64, func_id, run->hypercall.flags);
+                     ", flags 0x%" PRIx64, func_id,
+                     (uint64_t)run->hypercall.flags);
         return -EINVAL;
     }
 
@@ -1640,9 +1646,10 @@ static int kvm_arm_handle_ffa_hypercall(CPUState *cs, struct kvm_run *run)
     } else {
         trace_kvm_arm_ffa_stub(cs->cpu_index, func_id,
                                env->regs[1], env->regs[2]);
-        memset(env->regs, 0, 4 * sizeof(env->regs[0]));
         env->regs[0] = KVM_ARM_FFA_ERROR;
+        env->regs[1] = 0;
         env->regs[2] = KVM_ARM_FFA_NOT_SUPPORTED;
+        env->regs[3] = 0;
     }
 
     run->hypercall.ret = KVM_ARM_FFA_ERROR;
