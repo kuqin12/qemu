@@ -28,7 +28,6 @@ swtpm_pid=$(cat "$work_dir/swtpm.pid")
 qmp_log="$work_dir/qmp.log"
 printf '%s\n' \
     '{"execute":"qmp_capabilities"}' \
-    '{"execute":"qom-get","arguments":{"path":"/machine","property":"hybrid-shared-crb-verified"}}' \
     '{"execute":"human-monitor-command","arguments":{"command-line":"info mtree -f"}}' \
     '{"execute":"quit"}' |
     "$qemu" \
@@ -42,28 +41,20 @@ printf '%s\n' \
         -display none \
         -chardev "socket,id=chrtpm,path=$work_dir/swtpm.sock" \
         -tpmdev emulator,id=tpm0,chardev=chrtpm \
-        -device tpm-crb,tpmdev=tpm0 \
+        -device tpm-tis-device,tpmdev=tpm0 \
         -qmp stdio >"$qmp_log"
 
 python3 - "$qmp_log" <<'PY'
 import json
+import re
 import sys
 
 responses = []
-errors = []
 with open(sys.argv[1], encoding="utf-8") as stream:
     for line in stream:
         message = json.loads(line)
         if "return" in message:
             responses.append(message["return"])
-        if "error" in message:
-            errors.append(message["error"])
-
-if True not in responses:
-    raise SystemExit(
-        f"internal CRB alias check did not pass: responses={responses!r} "
-        f"errors={errors!r}"
-    )
 
 mtree = next(
     value for value in responses
@@ -73,12 +64,18 @@ sections = mtree.split("FlatView #")
 secure = next(section for section in sections if 'AS "cpu-secure-memory-0"' in section)
 system = next(section for section in sections if 'AS "memory", root: system' in section)
 
-if "000000000c000000-000000000c00007f" not in secure or "tpm-crb-mmio" not in secure:
-    raise SystemExit("external CRB MMIO is missing from the secure view")
-if "000000000c000080-000000000c000fff" not in secure or "tpm-crb-cmd" not in secure:
-    raise SystemExit("external CRB command buffer is missing from the secure view")
-if "tpm-crb" in system:
-    raise SystemExit("external CRB leaked into the KVM system view")
+match = re.search(
+    r"([0-9a-f]{16})-([0-9a-f]{16}).*tpm-tis-mmio",
+    secure,
+)
+if match is None:
+    raise SystemExit("dynamic TPM TIS MMIO is missing from the secure view")
+if "tpm-tis-mmio" in system or "tpm-ppi" in system:
+    raise SystemExit("external TPM device leaked into the KVM system view")
 
-print("shared_internal_crb=pass secure_external_crb=pass kvm_external_crb=absent")
+print(
+    "dynamic_tpm_model=tpm-tis-device "
+    f"secure_mmio=0x{match.group(1)}-0x{match.group(2)} "
+    "kvm_tpm=absent"
+)
 PY

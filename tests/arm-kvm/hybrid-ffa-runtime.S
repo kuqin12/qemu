@@ -5,7 +5,6 @@
 .equ UARTDR,            0x000
 .equ UARTFR,            0x018
 
-.equ INTERNAL_CRB,      0x40200000
 .equ STACK_TOP,         0x48000000
 
 .equ PSCI_SYSTEM_OFF,   0x84000008
@@ -21,11 +20,6 @@ _start:
     msr daifset, #0xf
     ldr x0, =STACK_TOP
     mov sp, x0
-
-    ldr x0, =INTERNAL_CRB
-    ldr x1, =0x4352424b564d5443
-    str x1, [x0]
-    dsb sy
 
     ldr x0, =FFA_DIRECT_REQ2
     ldr x1, =FFA_ENDPOINTS_REQ
