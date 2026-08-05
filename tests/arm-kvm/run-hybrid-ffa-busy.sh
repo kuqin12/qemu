@@ -21,6 +21,14 @@ truncate -s 64M "$work_dir/normal-flash.fd"
 
 normal_log="$work_dir/normal.log"
 trace_log="$work_dir/trace.log"
+
+swtpm socket \
+    --tpm2 \
+    --tpmstate "dir=$work_dir" \
+    --ctrl "type=unixio,path=$work_dir/swtpm.sock,terminate" \
+    --flags not-need-init \
+    --daemon
+
 set +e
 timeout --kill-after=5s 30s "$qemu" \
     -machine virt,hybrid-secure=on,gic-version=3 \
@@ -31,6 +39,9 @@ timeout --kill-after=5s 30s "$qemu" \
     -global driver=cfi.pflash01,property=secure,value=on \
     -drive "if=pflash,format=raw,unit=0,file=$secure_flash,readonly=on" \
     -drive "if=pflash,format=raw,unit=1,file=$work_dir/normal-flash.fd,readonly=on" \
+    -chardev "socket,id=chrtpm,path=$work_dir/swtpm.sock" \
+    -tpmdev emulator,id=tpm0,chardev=chrtpm \
+    -device tpm-tis-device,tpmdev=tpm0 \
     -display none \
     -monitor none \
     -serial "file:$normal_log" \
