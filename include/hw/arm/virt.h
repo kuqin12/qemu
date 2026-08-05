@@ -182,6 +182,7 @@ struct VirtMachineState {
     uint64_t hybrid_shadow_smoke_x0;
     uint64_t hybrid_shadow_stop_pc;
     uint64_t hybrid_shadow_direct_x0;
+    uint64_t hybrid_shadow_direct_x2;
     uint64_t hybrid_shadow_direct_x4;
     uint64_t hybrid_shadow_direct_x5;
     uint64_t hybrid_runtime_regs[18];

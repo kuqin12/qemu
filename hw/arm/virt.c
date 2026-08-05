@@ -2460,6 +2460,22 @@ static void virt_hybrid_shadow_execute(VirtMachineState *vms)
         bl33_elr_el2 = cpu->env.elr_el[2];
 
         memset(cpu->env.xregs, 0, sizeof(bl33_xregs));
+        cpu->env.xregs[0] = 0x84000063;
+        cpu->env.xregs[1] = 0x00010002;
+        cpu_set_pc(cs, vms->hybrid_trampoline_addr);
+        arm_rebuild_hflags(&cpu->env);
+        cs->exception_index = -1;
+        cs->halted = false;
+
+        ret = tcg_secondary_cpu_exec(cs);
+        if (ret != EXCP_HLT || (cpu->env.xregs[0] & (1ULL << 31)) ||
+            cpu->env.xregs[0] < 0x00010002) {
+            vms->hybrid_shadow_stop_reason = ret;
+            vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
+            goto restore_bl33;
+        }
+
+        memset(cpu->env.xregs, 0, sizeof(bl33_xregs));
         cpu->env.xregs[0] = 0xc400008d;
         cpu->env.xregs[1] = 0x00008002;
         cpu->env.xregs[2] = 0xaf4f0618a462b817;
@@ -2475,6 +2491,7 @@ static void virt_hybrid_shadow_execute(VirtMachineState *vms)
         vms->hybrid_shadow_stop_reason = ret;
         vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
         vms->hybrid_shadow_direct_x0 = cpu->env.xregs[0];
+        vms->hybrid_shadow_direct_x2 = cpu->env.xregs[2];
         vms->hybrid_shadow_direct_x4 = cpu->env.xregs[4];
         vms->hybrid_shadow_direct_x5 = cpu->env.xregs[5];
         vms->hybrid_shadow_direct_passed =
@@ -2485,6 +2502,7 @@ static void virt_hybrid_shadow_execute(VirtMachineState *vms)
              (cpu->env.xregs[4] == 0x05000002 &&
               cpu->env.xregs[5] == 0x00010000));
 
+    restore_bl33:
         memcpy(cpu->env.xregs, bl33_xregs, sizeof(bl33_xregs));
         pstate_write(&cpu->env, bl33_pstate);
         cpu->env.sp_el[2] = bl33_sp_el2;
@@ -2729,17 +2747,19 @@ static void virt_hybrid_shadow_boot(VirtMachineState *vms,
         if (!vms->hybrid_shadow_direct_passed) {
             error_report("mach-virt: hybrid FF-A direct request failed "
                          "(reason %d, PC 0x%" PRIx64 ", x0 0x%" PRIx64
-                         ", x4 0x%" PRIx64 ", x5 0x%" PRIx64 ")",
+                         ", x2 0x%" PRIx64 ", x4 0x%" PRIx64
+                         ", x5 0x%" PRIx64 ")",
                          vms->hybrid_shadow_stop_reason,
                          vms->hybrid_shadow_stop_pc,
                          vms->hybrid_shadow_direct_x0,
+                         vms->hybrid_shadow_direct_x2,
                          vms->hybrid_shadow_direct_x4,
                          vms->hybrid_shadow_direct_x5);
             exit(1);
         }
 
-         memcpy(vms->hybrid_bl33_xregs, cpu->env.xregs,
-             sizeof(vms->hybrid_bl33_xregs));
+        memcpy(vms->hybrid_bl33_xregs, cpu->env.xregs,
+               sizeof(vms->hybrid_bl33_xregs));
         return;
     }
 
@@ -2837,6 +2857,7 @@ void virt_machine_done(Notifier *notifier, void *data)
     ARMCPU *cpu = ARM_CPU(first_cpu);
     struct arm_boot_info *info = &vms->bootinfo;
     AddressSpace *as = arm_boot_address_space(cpu, info);
+    int dtb_size;
 
     cxl_hook_up_pxb_registers(vms->bus, &vms->cxl_devices_state,
                               &error_fatal);
@@ -2860,8 +2881,30 @@ void virt_machine_done(Notifier *notifier, void *data)
                                        vms->memmap[VIRT_PLATFORM_BUS].size,
                                        vms->irqmap[VIRT_PLATFORM_BUS]);
     }
-    if (arm_load_dtb(info->dtb_start, info, info->dtb_limit, as, ms, cpu) < 0) {
+    dtb_size = arm_load_dtb(info->dtb_start, info, info->dtb_limit,
+                            as, ms, cpu);
+    if (dtb_size < 0) {
         exit(1);
+    }
+
+    if (vms->hybrid_secure) {
+        AddressSpace *shadow_as = cpu_get_address_space(
+            vms->hybrid_shadow_cpu, ARMASIdx_S);
+        void *dtb = rom_ptr_for_as(as, info->dtb_start, dtb_size);
+
+        if (dtb_size == 0) {
+            error_report("mach-virt: no DTB available for hybrid secure "
+                         "firmware");
+            exit(1);
+        }
+        if (!dtb || address_space_write(shadow_as, info->dtb_start,
+                                        MEMTXATTRS_UNSPECIFIED, dtb,
+                                        dtb_size) != MEMTX_OK) {
+            error_report("mach-virt: failed to stage DTB for hybrid secure "
+                         "firmware");
+            exit(1);
+        }
+        virt_hybrid_shadow_boot(vms, info->firmware_loaded);
     }
 
     pci_bus_add_fw_cfg_extra_pci_roots(vms->fw_cfg, vms->bus,
@@ -3709,10 +3752,6 @@ static void machvirt_init(MachineState *machine)
 
     if (vms->secure || vms->hybrid_secure) {
         create_secure_ram(vms, secure_sysmem, secure_tag_sysmem);
-    }
-
-    if (vms->hybrid_secure) {
-        virt_hybrid_shadow_boot(vms, firmware_loaded);
     }
 
     if (tag_sysmem) {
