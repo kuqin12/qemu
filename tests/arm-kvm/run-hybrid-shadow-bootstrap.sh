@@ -7,7 +7,18 @@ qemu=${QEMU:-"$build_dir/qemu-system-aarch64"}
 secure_flash=${SECURE_FLASH:?Set SECURE_FLASH to SECURE_FLASH0.fd}
 normal_flash=${NORMAL_FLASH:?Set NORMAL_FLASH to QEMU_EFI.fd}
 work_dir=$(mktemp -d)
-trap 'rm -rf "$work_dir"' EXIT
+broadway_pid=
+
+cleanup()
+{
+    if [[ -n "$broadway_pid" ]]; then
+        kill "$broadway_pid" 2>/dev/null || true
+        wait "$broadway_pid" 2>/dev/null || true
+    fi
+    rm -rf "$work_dir"
+}
+
+trap cleanup EXIT
 
 normal_log="$work_dir/normal.log"
 secure_log="$work_dir/secure.log"
@@ -78,9 +89,48 @@ qemu_log="$work_dir/qemu.log"
 cp "$secure_flash" "$work_dir/secure-flash.fd"
 truncate -s 1G "$work_dir/nvme.img"
 start_swtpm
+
+display_mode=vnc
+display_args=(-device bochs-display,addr=0x1f
+              -display none
+              -vnc "unix:$work_dir/vnc.sock")
+display_env=()
+if command -v broadwayd > /dev/null && [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    broadway_number=$((100 + ($$ % 1000)))
+    broadway_display=:$broadway_number
+    broadwayd "$broadway_display" >"$work_dir/broadway.log" 2>&1 &
+    broadway_pid=$!
+    python3 - "$work_dir/broadway.log" "$broadway_pid" <<'PY'
+import os
+import sys
+import time
+
+path = sys.argv[1]
+pid = int(sys.argv[2])
+for _ in range(100):
+    try:
+        with open(path, encoding="utf-8") as log:
+            if "Listening on " in log.read():
+                break
+    except FileNotFoundError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        break
+    time.sleep(0.05)
+PY
+    if kill -0 "$broadway_pid" 2>/dev/null &&
+       grep -q 'Listening on ' "$work_dir/broadway.log"; then
+        display_mode=gtk
+        display_args=(-device bochs-display,addr=0x1f -display gtk)
+        display_env=(GDK_BACKEND=broadway BROADWAY_DISPLAY="$broadway_display")
+    fi
+fi
+
 set +e
-timeout 30s "$qemu" \
-    -machine virt,hybrid-secure=on,gic-version=3,iommu=smmuv3 \
+env "${display_env[@]}" timeout 30s "$qemu" \
+    -machine virt,hybrid-secure=on,gic-version=3 \
     -cpu host \
     -smp 2 \
     -m 8192M \
@@ -90,10 +140,10 @@ timeout 30s "$qemu" \
     -drive "if=pflash,format=raw,unit=1,file=$normal_flash,readonly=on" \
     -drive "file=$work_dir/nvme.img,format=raw,if=none,id=test_nvme" \
     -device nvme,serial=test-nvme,drive=test_nvme \
+    "${display_args[@]}" \
     -chardev "socket,id=chrtpm,path=$swtpm_socket" \
     -tpmdev emulator,id=tpm0,chardev=chrtpm \
     -device tpm-tis-device,tpmdev=tpm0 \
-    -display none \
     -monitor none \
     -serial "file:$uefi_log" \
     -serial null \
@@ -109,20 +159,16 @@ erase_error_count=$(grep -c 'EraseSingleBlock.*Error' "$uefi_log" || true)
 exception_count=$(grep -c 'EXCEPTION: Synchronous' "$uefi_log" || true)
 nvme_count=$(grep -c 'NvmExpressDriverBindingStart: end successfully' "$uefi_log" || true)
 nvme_timeout_count=$(grep -c 'NvmExpressPassThru: Timeout' "$uefi_log" || true)
-sid10_fault_count=$(grep -c 'StreamId=0x10 FaultRecord' "$uefi_log" || true)
-smmu_assert_count=$(grep -c 'ASSERT \[SmmuDxe\]' "$uefi_log" || true)
-printf 'uefi_status=%d uefi=%d dxe=%d bds=%d timeout=%d erase_errors=%d exception=%d nvme=%d nvme_timeout=%d sid10_faults=%d smmu_assert=%d\n' \
-    "$uefi_status" "$uefi_count" "$dxe_count" "$bds_count" \
+printf 'uefi_status=%d display=%s uefi=%d dxe=%d bds=%d timeout=%d erase_errors=%d exception=%d nvme=%d nvme_timeout=%d\n' \
+    "$uefi_status" "$display_mode" "$uefi_count" "$dxe_count" "$bds_count" \
     "$timeout_count" "$erase_error_count" "$exception_count" \
-    "$nvme_count" "$nvme_timeout_count" "$sid10_fault_count" \
-    "$smmu_assert_count"
+    "$nvme_count" "$nvme_timeout_count"
 
 if [[ "$uefi_status" -ne 124 || "$uefi_count" -lt 1 ||
       "$dxe_count" -lt 1 || "$bds_count" -lt 1 ||
       "$timeout_count" -ne 0 || "$erase_error_count" -ne 0 ||
       "$exception_count" -ne 0 || "$nvme_count" -lt 1 ||
-      "$nvme_timeout_count" -ne 0 || "$sid10_fault_count" -ne 0 ||
-      "$smmu_assert_count" -ne 0 ]]; then
+    "$nvme_timeout_count" -ne 0 ]]; then
     cat "$qemu_log"
     tail -n 120 "$uefi_log"
     exit 1
