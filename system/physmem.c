@@ -779,7 +779,10 @@ void cpu_address_space_init(CPUState *cpu, int asidx,
     newas->cpu = cpu;
     newas->as = as;
     if (tcg_enabled() || cpu->secondary_tcg) {
-        newas->tcg_as_listener.log_global_after_sync = tcg_log_global_after_sync;
+        /* Custom secondary workers do not service run_on_cpu() while idle. */
+        if (!cpu->secondary_tcg) {
+            newas->tcg_as_listener.log_global_after_sync = tcg_log_global_after_sync;
+        }
         newas->tcg_as_listener.commit = tcg_commit;
         newas->tcg_as_listener.name = "tcg";
         memory_listener_register(&newas->tcg_as_listener, as);
