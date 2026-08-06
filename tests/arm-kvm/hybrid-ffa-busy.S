@@ -7,6 +7,8 @@
 
 .equ PSCI_CPU_ON,        0xc4000003
 .equ PSCI_SYSTEM_OFF,    0x84000008
+.equ FFA_VERSION,        0x84000063
+.equ FFA_VERSION_1_2,    0x00010002
 .equ FFA_DIRECT_REQ2,    0xc400008d
 .equ FFA_DIRECT_RESP2,   0xc400008e
 .equ FFA_ERROR,          0x84000060
@@ -29,6 +31,14 @@ clear_shared:
     str xzr, [x0], #8
     b clear_shared
 shared_cleared:
+
+    ldr x0, =FFA_VERSION
+    ldr x1, =FFA_VERSION_1_2
+    smc #0
+    tbnz x0, #31, failed
+    ldr x1, =FFA_VERSION_1_2
+    cmp x0, x1
+    b.lo failed
 
     ldr x0, =PSCI_CPU_ON
     mov x1, #1

@@ -51,9 +51,9 @@ status=$?
 set -e
 
 pass_count=$(grep -c '^HYBRID FFA BUSY PASS$' "$normal_log" || true)
-trace_count=$(grep -c '^kvm_arm_ffa_stub' "$trace_log" || true)
-cpu0_count=$(grep -c '^kvm_arm_ffa_stub cpu 0 ' "$trace_log" || true)
-cpu1_count=$(grep -c '^kvm_arm_ffa_stub cpu 1 ' "$trace_log" || true)
+trace_count=$(grep -c '^kvm_arm_ffa_stub cpu [01] function 0xc400008d ' "$trace_log" || true)
+cpu0_count=$(grep -c '^kvm_arm_ffa_stub cpu 0 function 0xc400008d ' "$trace_log" || true)
+cpu1_count=$(grep -c '^kvm_arm_ffa_stub cpu 1 function 0xc400008d ' "$trace_log" || true)
 printf 'status=%d pass=%d kvm_exits=%d cpu0=%d cpu1=%d\n' \
     "$status" "$pass_count" "$trace_count" "$cpu0_count" "$cpu1_count"
 

@@ -8,6 +8,10 @@
 .equ STACK_TOP,         0x48000000
 
 .equ PSCI_SYSTEM_OFF,   0x84000008
+.equ FFA_VERSION,       0x84000063
+.equ FFA_VERSION_1_2,   0x00010002
+.equ FFA_ERROR,         0x84000060
+.equ FFA_ABORTED,       0x00000000fffffff8
 .equ FFA_DIRECT_REQ2,   0xc400008d
 .equ FFA_DIRECT_RESP2,  0xc400008e
 .equ FFA_ENDPOINTS_REQ, 0x00008002
@@ -20,6 +24,26 @@ _start:
     msr daifset, #0xf
     ldr x0, =STACK_TOP
     mov sp, x0
+
+    ldr x0, =FFA_VERSION
+    ldr x1, =FFA_VERSION_1_2
+    smc #0
+#ifdef EXPECT_TIMEOUT
+    mov x20, x0
+    mov x24, x2
+    ldr x1, =FFA_ERROR
+    cmp x20, x1
+    b.ne version_succeeded
+    ldr x1, =FFA_ABORTED
+    cmp x24, x1
+    b.eq passed
+    b failed
+version_succeeded:
+#endif
+    tbnz x0, #31, failed
+    ldr x1, =FFA_VERSION_1_2
+    cmp x0, x1
+    b.lo failed
 
     ldr x0, =FFA_DIRECT_REQ2
     ldr x1, =FFA_ENDPOINTS_REQ
@@ -43,9 +67,19 @@ _start:
 
     mov x20, x0
     mov x21, x1
+    mov x24, x2
     mov x22, x4
     mov x23, x5
 
+#ifdef EXPECT_TIMEOUT
+    ldr x0, =FFA_ERROR
+    cmp x20, x0
+    b.ne failed
+    ldr x0, =FFA_ABORTED
+    cmp x24, x0
+    b.eq passed
+    b failed
+#else
     ldr x0, =FFA_DIRECT_RESP2
     cmp x20, x0
     b.ne failed
@@ -61,6 +95,7 @@ _start:
     ldr x0, =TPM_VERSION_1_0
     cmp x23, x0
     b.ne failed
+#endif
 
 passed:
     ldr x0, =pass
@@ -128,5 +163,10 @@ putc_wait:
     ret
 
 .section .rodata, "a"
+#ifdef EXPECT_TIMEOUT
+pass: .asciz "HYBRID FFA TIMEOUT PASS\n"
+fail: .asciz "HYBRID FFA TIMEOUT FAIL "
+#else
 pass: .asciz "HYBRID FFA RUNTIME PASS\n"
 fail: .asciz "HYBRID FFA RUNTIME FAIL "
+#endif
