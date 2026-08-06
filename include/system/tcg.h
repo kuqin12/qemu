@@ -21,7 +21,8 @@ bool tcg_secondary_cpu_realize(CPUState *cpu, Error **errp);
 void tcg_secondary_cpu_unrealize(CPUState *cpu);
 void tcg_secondary_cpu_thread_init(CPUState *cpu);
 void tcg_secondary_cpu_thread_destroy(void);
-int tcg_secondary_cpu_exec(CPUState *cpu);
+void tcg_secondary_cpu_kick(CPUState *cpu);
+int tcg_secondary_cpu_exec(CPUState *cpu, const bool *stop_request);
 #else
 #define tcg_enabled() 0
 static inline bool tcg_init_secondary(void)
@@ -41,7 +42,11 @@ static inline void tcg_secondary_cpu_thread_init(CPUState *cpu)
 static inline void tcg_secondary_cpu_thread_destroy(void)
 {
 }
-static inline int tcg_secondary_cpu_exec(CPUState *cpu)
+static inline void tcg_secondary_cpu_kick(CPUState *cpu)
+{
+}
+static inline int tcg_secondary_cpu_exec(CPUState *cpu,
+                                         const bool *stop_request)
 {
 	return -1;
 }

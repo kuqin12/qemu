@@ -2478,13 +2478,13 @@ int kvm_arch_put_registers(CPUState *cs, KvmPutState level, Error **errp)
 }
 
 int kvm_arm_set_bl33_handoff(ARMCPU *cpu, uint64_t entry,
-                             const uint64_t xregs[4])
+                             const uint64_t xregs[31])
 {
     CPUState *cs = CPU(cpu);
     CPUARMState *env = &cpu->env;
     int ret;
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 31; i++) {
         env->xregs[i] = xregs[i];
         ret = kvm_set_one_reg(cs, AARCH64_CORE_REG(regs.regs[i]),
                               &env->xregs[i]);

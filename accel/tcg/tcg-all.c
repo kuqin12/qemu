@@ -25,6 +25,7 @@
 
 #include "qemu/osdep.h"
 #include "system/tcg.h"
+#include "exec/cputlb.h"
 #include "exec/replay-core.h"
 #include "exec/icount.h"
 #include "tcg/startup.h"
@@ -40,11 +41,13 @@
 #ifndef CONFIG_USER_ONLY
 #include "hw/core/boards.h"
 #include "exec/tb-flush.h"
+#include "qemu/main-loop.h"
 #include "system/runstate.h"
 #endif
 #include "accel/accel-ops.h"
 #include "accel/accel-cpu-ops.h"
 #include "accel/tcg/cpu-ops.h"
+#include "accel/tcg/tcg-accel-ops.h"
 #include "internal-common.h"
 
 
@@ -116,12 +119,18 @@ bool tcg_init_secondary(void)
 bool tcg_secondary_cpu_realize(CPUState *cpu, Error **errp)
 {
     g_assert(tcg_runtime_initialized);
-    return tcg_exec_realizefn(cpu, errp);
+    cpu->secondary_tcg = true;
+    if (!tcg_exec_realizefn(cpu, errp)) {
+        cpu->secondary_tcg = false;
+        return false;
+    }
+    return true;
 }
 
 void tcg_secondary_cpu_unrealize(CPUState *cpu)
 {
     tcg_exec_unrealizefn(cpu);
+    cpu->secondary_tcg = false;
 }
 
 void tcg_secondary_cpu_thread_init(CPUState *cpu)
@@ -145,23 +154,43 @@ void tcg_secondary_cpu_thread_destroy(void)
     rcu_unregister_thread();
 }
 
-int tcg_secondary_cpu_exec(CPUState *cpu)
+void tcg_secondary_cpu_kick(CPUState *cpu)
 {
+    tcg_kick_vcpu_thread(cpu);
+}
+
+int tcg_secondary_cpu_exec(CPUState *cpu, const bool *stop_request)
+{
+    bool stop_requested;
     int ret;
 
     g_assert(tcg_secondary_active);
     g_assert(current_cpu == cpu);
 
     do {
+        if (qatomic_xchg(&cpu->secondary_tcg_tlb_flush_pending, false)) {
+            tlb_flush(cpu);
+        }
+        stop_requested = false;
         cpu_exec_start(cpu);
         ret = cpu_exec(cpu);
         cpu_exec_end(cpu);
 
+    #ifndef CONFIG_USER_ONLY
+        bql_lock();
+        qemu_process_cpu_events_common(cpu);
+        bql_unlock();
+    #endif
+
         if (ret == EXCP_ATOMIC) {
             cpu_exec_step_atomic(cpu);
+        } else if (ret == EXCP_INTERRUPT) {
+            stop_requested = stop_request && qatomic_read(stop_request);
+            qatomic_set(&cpu->exit_request, false);
         }
-    } while (ret == EXCP_YIELD || ret == EXCP_INTERRUPT ||
-             ret == EXCP_ATOMIC);
+    } while (!stop_requested &&
+             (ret == EXCP_YIELD || ret == EXCP_INTERRUPT ||
+              ret == EXCP_ATOMIC));
     return ret;
 }
 

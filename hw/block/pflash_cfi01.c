@@ -989,6 +989,15 @@ MemoryRegion *pflash_cfi01_get_memory(PFlashCFI01 *fl)
     return &fl->mem;
 }
 
+void pflash_cfi01_get_state(PFlashCFI01 *pfl, PFlashCFI01State *state)
+{
+    state->counter = pfl->counter;
+    state->block_offset = pfl->blk_offset;
+    state->write_cycle = pfl->wcycle;
+    state->command = pfl->cmd;
+    state->status = pfl->status;
+}
+
 /*
  * Handle -drive if=pflash for machines that use properties.
  * If @dinfo is null, do nothing.

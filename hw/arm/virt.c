@@ -110,7 +110,11 @@ enum {
     HYBRID_SHADOW_STAGE_BOOTSTRAP,
     HYBRID_SHADOW_STAGE_READY,
     HYBRID_SHADOW_STAGE_RUNTIME,
+    HYBRID_SHADOW_STAGE_FAILED,
 };
+
+#define HYBRID_SECURE_CALL_TIMEOUT_MS 5000
+#define HYBRID_SECURE_CANCEL_TIMEOUT_MS 1000
 
 /*
  * This cannot be called from the virt_machine_class_init() because
@@ -2424,10 +2428,17 @@ static void create_secure_ram(VirtMachineState *vms,
 
 static void virt_hybrid_runtime_execute(VirtMachineState *vms);
 
+static hwaddr virt_hybrid_bl33_entry(const VirtMachineState *vms)
+{
+    return vms->memmap[VIRT_FLASH].base +
+           vms->memmap[VIRT_FLASH].size / 2;
+}
+
 static void virt_hybrid_shadow_execute(VirtMachineState *vms)
 {
     CPUState *cs = vms->hybrid_shadow_cpu;
     ARMCPU *cpu = ARM_CPU(cs);
+    hwaddr bl33_entry = virt_hybrid_bl33_entry(vms);
     int ret;
 
     if (vms->hybrid_shadow_stage == HYBRID_SHADOW_STAGE_RUNTIME) {
@@ -2437,78 +2448,21 @@ static void virt_hybrid_shadow_execute(VirtMachineState *vms)
 
     cs->stopped = false;
     cs->halted = false;
-    ret = tcg_secondary_cpu_exec(cs);
+    ret = tcg_secondary_cpu_exec(cs, NULL);
     vms->hybrid_shadow_stop_reason = ret;
     vms->hybrid_shadow_smoke_x0 = cpu->env.xregs[0];
     vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
     if (vms->hybrid_shadow_stage == HYBRID_SHADOW_STAGE_BOOTSTRAP) {
-        uint64_t bl33_xregs[ARRAY_SIZE(cpu->env.xregs)];
-        uint64_t bl33_pstate;
-        uint64_t bl33_sp_el2;
-        uint64_t bl33_elr_el2;
-
         vms->hybrid_shadow_bootstrap_passed =
-            ret == EXCP_DEBUG && vms->hybrid_shadow_stop_pc == 0x04000000;
+            ret == EXCP_DEBUG && vms->hybrid_shadow_stop_pc == bl33_entry;
         if (!vms->hybrid_shadow_bootstrap_passed) {
             goto out;
         }
 
-        cpu_breakpoint_remove(cs, 0x04000000, BP_GDB);
-        memcpy(bl33_xregs, cpu->env.xregs, sizeof(bl33_xregs));
-        bl33_pstate = pstate_read(&cpu->env);
-        bl33_sp_el2 = cpu->env.sp_el[2];
-        bl33_elr_el2 = cpu->env.elr_el[2];
-
-        memset(cpu->env.xregs, 0, sizeof(bl33_xregs));
-        cpu->env.xregs[0] = 0x84000063;
-        cpu->env.xregs[1] = 0x00010002;
-        cpu_set_pc(cs, vms->hybrid_trampoline_addr);
-        arm_rebuild_hflags(&cpu->env);
-        cs->exception_index = -1;
-        cs->halted = false;
-
-        ret = tcg_secondary_cpu_exec(cs);
-        if (ret != EXCP_HLT || (cpu->env.xregs[0] & (1ULL << 31)) ||
-            cpu->env.xregs[0] < 0x00010002) {
-            vms->hybrid_shadow_stop_reason = ret;
-            vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
-            goto restore_bl33;
-        }
-
-        memset(cpu->env.xregs, 0, sizeof(bl33_xregs));
-        cpu->env.xregs[0] = 0xc400008d;
-        cpu->env.xregs[1] = 0x00008002;
-        cpu->env.xregs[2] = 0xaf4f0618a462b817;
-        cpu->env.xregs[3] = 0x613835589a08b386;
-        cpu->env.xregs[4] = 0x0f000001;
-        cpu_set_pc(cs, vms->hybrid_trampoline_addr);
-        arm_rebuild_hflags(&cpu->env);
-        cs->exception_index = -1;
-        cs->halted = false;
-
+        cpu_breakpoint_remove(cs, bl33_entry, BP_GDB);
+        memcpy(vms->hybrid_bl33_xregs, cpu->env.xregs,
+               sizeof(vms->hybrid_bl33_xregs));
         vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_READY;
-        ret = tcg_secondary_cpu_exec(cs);
-        vms->hybrid_shadow_stop_reason = ret;
-        vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
-        vms->hybrid_shadow_direct_x0 = cpu->env.xregs[0];
-        vms->hybrid_shadow_direct_x2 = cpu->env.xregs[2];
-        vms->hybrid_shadow_direct_x4 = cpu->env.xregs[4];
-        vms->hybrid_shadow_direct_x5 = cpu->env.xregs[5];
-        vms->hybrid_shadow_direct_passed =
-            ret == EXCP_HLT &&
-            cpu->env.xregs[0] == 0xc400008e &&
-            cpu->env.xregs[1] == 0x80020000 &&
-            (cpu->env.xregs[4] == UINT64_MAX ||
-             (cpu->env.xregs[4] == 0x05000002 &&
-              cpu->env.xregs[5] == 0x00010000));
-
-    restore_bl33:
-        memcpy(cpu->env.xregs, bl33_xregs, sizeof(bl33_xregs));
-        pstate_write(&cpu->env, bl33_pstate);
-        cpu->env.sp_el[2] = bl33_sp_el2;
-        cpu->env.elr_el[2] = bl33_elr_el2;
-        cpu_set_pc(cs, 0x04000000);
-        arm_rebuild_hflags(&cpu->env);
     } else {
         vms->hybrid_shadow_smoke_passed =
             ret == EXCP_HLT && vms->hybrid_shadow_smoke_x0 == 42;
@@ -2541,7 +2495,9 @@ static void *virt_hybrid_shadow_worker(void *opaque)
         }
 
         vms->hybrid_shadow_worker_request = false;
+        qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
         virt_hybrid_shadow_execute(vms);
+        qemu_mutex_lock(&vms->hybrid_shadow_mutex);
         vms->hybrid_shadow_worker_done = true;
         qemu_cond_signal(&vms->hybrid_shadow_cond);
     }
@@ -2571,10 +2527,14 @@ static void virt_hybrid_runtime_execute(VirtMachineState *vms)
     cs->exception_index = -1;
     cs->halted = false;
 
-    ret = tcg_secondary_cpu_exec(cs);
+    ret = tcg_secondary_cpu_exec(cs,
+                                 &vms->hybrid_runtime_cancel_requested);
     vms->hybrid_shadow_stop_reason = ret;
     vms->hybrid_shadow_stop_pc = cs->cc->get_pc(cs);
-    if (ret == EXCP_HLT) {
+    if (qatomic_read(&vms->hybrid_runtime_cancel_requested) &&
+        ret == EXCP_INTERRUPT) {
+        vms->hybrid_runtime_result = -ETIMEDOUT;
+    } else if (ret == EXCP_HLT) {
         memcpy(vms->hybrid_runtime_regs, cpu->env.xregs,
                sizeof(vms->hybrid_runtime_regs));
         vms->hybrid_runtime_result = 0;
@@ -2619,6 +2579,8 @@ static void virt_hybrid_shadow_run_worker(VirtMachineState *vms)
 int arm_hybrid_ffa_call(uint64_t regs[18])
 {
     VirtMachineState *vms;
+    uint64_t function_id = regs[0];
+    bool timed_out = false;
     int ret;
 
     if (!current_machine ||
@@ -2644,6 +2606,7 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
     }
 
     vms->hybrid_runtime_inflight = true;
+    qatomic_set(&vms->hybrid_runtime_cancel_requested, false);
     memcpy(vms->hybrid_runtime_regs, regs,
            sizeof(vms->hybrid_runtime_regs));
     vms->hybrid_runtime_result = -EINPROGRESS;
@@ -2653,8 +2616,30 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
     qemu_cond_signal(&vms->hybrid_shadow_cond);
 
     while (!vms->hybrid_shadow_worker_done) {
-        qemu_cond_wait(&vms->hybrid_shadow_cond,
-                       &vms->hybrid_shadow_mutex);
+        if (vms->hybrid_secure_call_timeout_ms == 0) {
+            qemu_cond_wait(&vms->hybrid_shadow_cond,
+                           &vms->hybrid_shadow_mutex);
+        } else if (!qemu_cond_timedwait(&vms->hybrid_shadow_cond,
+                                        &vms->hybrid_shadow_mutex,
+                                        vms->hybrid_secure_call_timeout_ms)) {
+            timed_out = true;
+            qatomic_set(&vms->hybrid_runtime_cancel_requested, true);
+            tcg_secondary_cpu_kick(vms->hybrid_shadow_cpu);
+            break;
+        }
+    }
+
+    while (timed_out && !vms->hybrid_shadow_worker_done) {
+        if (!qemu_cond_timedwait(&vms->hybrid_shadow_cond,
+                                 &vms->hybrid_shadow_mutex,
+                                 HYBRID_SECURE_CANCEL_TIMEOUT_MS)) {
+            error_report("mach-virt: timed-out hybrid secure call 0x%"
+                         PRIx64 " did not stop; stopping the VM",
+                         function_id);
+            qemu_system_vmstop_request(RUN_STATE_INTERNAL_ERROR);
+            qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+            return -ETIMEDOUT;
+        }
     }
 
     ret = vms->hybrid_runtime_result;
@@ -2662,8 +2647,26 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
         memcpy(regs, vms->hybrid_runtime_regs,
                sizeof(vms->hybrid_runtime_regs));
     }
-    vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_READY;
+    if (timed_out) {
+        PFlashCFI01State flash_state;
+
+        pflash_cfi01_get_state(vms->flash[0], &flash_state);
+        error_report("mach-virt: hybrid secure call 0x%" PRIx64
+                     " timed out after %u ms (reason %d, PC 0x%" PRIx64
+                     "); flash0 wcycle=%u cmd=0x%02x status=0x%02x "
+                     "counter=%" PRIu64 " block-offset=%d; disabling the "
+                     "secure bridge",
+                     function_id, vms->hybrid_secure_call_timeout_ms,
+                     vms->hybrid_shadow_stop_reason,
+                     vms->hybrid_shadow_stop_pc, flash_state.write_cycle,
+                     flash_state.command, flash_state.status,
+                     flash_state.counter, flash_state.block_offset);
+        vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_FAILED;
+    } else {
+        vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_READY;
+    }
     vms->hybrid_runtime_inflight = false;
+    qatomic_set(&vms->hybrid_runtime_cancel_requested, false);
     qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
     return ret;
 }
@@ -2678,7 +2681,7 @@ static void virt_hybrid_kvm_handoff_reset(void *opaque)
         return;
     }
 
-    ret = kvm_arm_set_bl33_handoff(cpu, 0x04000000,
+    ret = kvm_arm_set_bl33_handoff(cpu, virt_hybrid_bl33_entry(vms),
                                    vms->hybrid_bl33_xregs);
     if (ret) {
         error_report("mach-virt: failed to transfer BL33 state to KVM: %s",
@@ -2724,8 +2727,10 @@ static void virt_hybrid_shadow_boot(VirtMachineState *vms,
     MemTxResult result;
 
     if (firmware_loaded) {
+        hwaddr bl33_entry = virt_hybrid_bl33_entry(vms);
+
         vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_BOOTSTRAP;
-        if (cpu_breakpoint_insert(cs, 0x04000000, BP_GDB, NULL)) {
+        if (cpu_breakpoint_insert(cs, bl33_entry, BP_GDB, NULL)) {
             error_report("mach-virt: failed to set hybrid BL33 boundary");
             exit(1);
         }
@@ -2744,22 +2749,6 @@ static void virt_hybrid_shadow_boot(VirtMachineState *vms,
                          cpu->env.cp15.esr_el[3], cpu->env.elr_el[3]);
             exit(1);
         }
-        if (!vms->hybrid_shadow_direct_passed) {
-            error_report("mach-virt: hybrid FF-A direct request failed "
-                         "(reason %d, PC 0x%" PRIx64 ", x0 0x%" PRIx64
-                         ", x2 0x%" PRIx64 ", x4 0x%" PRIx64
-                         ", x5 0x%" PRIx64 ")",
-                         vms->hybrid_shadow_stop_reason,
-                         vms->hybrid_shadow_stop_pc,
-                         vms->hybrid_shadow_direct_x0,
-                         vms->hybrid_shadow_direct_x2,
-                         vms->hybrid_shadow_direct_x4,
-                         vms->hybrid_shadow_direct_x5);
-            exit(1);
-        }
-
-        memcpy(vms->hybrid_bl33_xregs, cpu->env.xregs,
-               sizeof(vms->hybrid_bl33_xregs));
         return;
     }
 
@@ -3903,21 +3892,6 @@ static bool virt_get_hybrid_shadow_bootstrap_passed(Object *obj, Error **errp)
     return value;
 }
 
-static bool virt_get_hybrid_shadow_direct_passed(Object *obj, Error **errp)
-{
-    VirtMachineState *vms = VIRT_MACHINE(obj);
-    bool value;
-
-    if (!vms->hybrid_shadow_worker_created) {
-        return false;
-    }
-    qemu_mutex_lock(&vms->hybrid_shadow_mutex);
-    value = vms->hybrid_shadow_direct_passed;
-    qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
-
-    return value;
-}
-
 static bool virt_get_hybrid_kvm_handoff_ready(Object *obj, Error **errp)
 {
     VirtMachineState *vms = VIRT_MACHINE(obj);
@@ -3938,6 +3912,25 @@ static bool virt_get_hybrid_shadow_worker_alive(Object *obj, Error **errp)
     qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
 
     return value;
+}
+
+static void virt_get_hybrid_secure_call_timeout(Object *obj, Visitor *v,
+                                                 const char *name,
+                                                 void *opaque, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+    uint32_t value = vms->hybrid_secure_call_timeout_ms;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void virt_set_hybrid_secure_call_timeout(Object *obj, Visitor *v,
+                                                 const char *name,
+                                                 void *opaque, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    visit_type_uint32(v, name, &vms->hybrid_secure_call_timeout_ms, errp);
 }
 
 static void virt_get_hybrid_shadow_stop_pc(Object *obj, Visitor *v,
@@ -4936,11 +4929,6 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                               virt_get_hybrid_shadow_current_pc,
                               NULL, NULL, NULL);
 
-    object_class_property_add_bool(oc, "hybrid-shadow-direct-passed",
-                                   virt_get_hybrid_shadow_direct_passed, NULL);
-    object_class_property_set_description(oc, "hybrid-shadow-direct-passed",
-        "Whether the synthetic MSSP FF-A direct request returned");
-
     object_class_property_add_bool(oc, "hybrid-kvm-handoff-ready",
                                    virt_get_hybrid_kvm_handoff_ready, NULL);
     object_class_property_set_description(oc, "hybrid-kvm-handoff-ready",
@@ -4950,6 +4938,13 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                    virt_get_hybrid_shadow_worker_alive, NULL);
     object_class_property_set_description(oc, "hybrid-shadow-worker-alive",
         "Whether the dedicated shadow TCG worker is available");
+
+    object_class_property_add(oc, "hybrid-secure-call-timeout-ms", "uint32",
+                              virt_get_hybrid_secure_call_timeout,
+                              virt_set_hybrid_secure_call_timeout, NULL, NULL);
+    object_class_property_set_description(oc,
+        "hybrid-secure-call-timeout-ms",
+        "Maximum runtime secure-call duration; zero disables the timeout");
 
     object_class_property_add_bool(oc, "virtualization", virt_get_virt,
                                    virt_set_virt);
@@ -5092,6 +5087,7 @@ static void virt_instance_init(Object *obj)
      * boot UEFI blobs which assume no TrustZone support.
      */
     vms->secure = false;
+    vms->hybrid_secure_call_timeout_ms = HYBRID_SECURE_CALL_TIMEOUT_MS;
 
     /* EL2 is also disabled by default, for similar reasons */
     vms->virt = false;

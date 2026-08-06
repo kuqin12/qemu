@@ -168,7 +168,6 @@ struct VirtMachineState {
     bool hybrid_shadow_ready;
     bool hybrid_shadow_smoke_passed;
     bool hybrid_shadow_bootstrap_passed;
-    bool hybrid_shadow_direct_passed;
     bool hybrid_kvm_handoff_ready;
     bool hybrid_kvm_handoff_pending;
     bool hybrid_initial_reset_done;
@@ -178,17 +177,15 @@ struct VirtMachineState {
     bool hybrid_shadow_worker_done;
     bool hybrid_shadow_worker_stop;
     bool hybrid_runtime_inflight;
+    bool hybrid_runtime_cancel_requested;
     unsigned int hybrid_shadow_stage;
+    uint32_t hybrid_secure_call_timeout_ms;
     uint64_t hybrid_shadow_smoke_x0;
     uint64_t hybrid_shadow_stop_pc;
-    uint64_t hybrid_shadow_direct_x0;
-    uint64_t hybrid_shadow_direct_x2;
-    uint64_t hybrid_shadow_direct_x4;
-    uint64_t hybrid_shadow_direct_x5;
     uint64_t hybrid_runtime_regs[18];
     uint64_t hybrid_trampoline_addr;
     int hybrid_runtime_result;
-    uint64_t hybrid_bl33_xregs[4];
+    uint64_t hybrid_bl33_xregs[31];
     int hybrid_shadow_stop_reason;
     bool highmem;
     bool highmem_compact;

@@ -11,6 +11,13 @@
 #define TYPE_PFLASH_CFI01 "cfi.pflash01"
 OBJECT_DECLARE_SIMPLE_TYPE(PFlashCFI01, PFLASH_CFI01)
 
+typedef struct PFlashCFI01State {
+    uint64_t counter;
+    int32_t block_offset;
+    uint8_t write_cycle;
+    uint8_t command;
+    uint8_t status;
+} PFlashCFI01State;
 
 PFlashCFI01 *pflash_cfi01_register(hwaddr base,
                                    const char *name,
@@ -24,6 +31,7 @@ PFlashCFI01 *pflash_cfi01_register(hwaddr base,
 BlockBackend *pflash_cfi01_get_blk(PFlashCFI01 *fl);
 MemoryRegion *pflash_cfi01_get_memory(PFlashCFI01 *fl);
 void pflash_cfi01_legacy_drive(PFlashCFI01 *dev, DriveInfo *dinfo);
+void pflash_cfi01_get_state(PFlashCFI01 *dev, PFlashCFI01State *state);
 
 /* pflash_cfi02.c */
 

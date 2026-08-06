@@ -2464,8 +2464,8 @@ static void arm_cpu_unrealizefn(DeviceState *dev)
     ARMCPUClass *acc = ARM_CPU_GET_CLASS(dev);
 
     if (cpu->shadow_tcg) {
-        tcg_secondary_cpu_unrealize(CPU(cpu));
         cpu_destroy_address_spaces(CPU(cpu));
+        tcg_secondary_cpu_unrealize(CPU(cpu));
         return;
     }
 

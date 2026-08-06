@@ -226,7 +226,7 @@ void kvm_arm_pvtime_init(ARMCPU *cpu, uint64_t ipa);
 int kvm_arm_set_irq(int cpu, int irqtype, int irq, int level);
 
 int kvm_arm_set_bl33_handoff(ARMCPU *cpu, uint64_t entry,
-                             const uint64_t xregs[4]);
+                             const uint64_t xregs[31]);
 
 int arm_hybrid_ffa_call(uint64_t regs[18]);
 

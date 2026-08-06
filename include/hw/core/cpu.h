@@ -423,6 +423,9 @@ struct qemu_work_item;
  * @has_waiter: #true if a CPU is currently waiting for the cpu_exec_end;
  * valid under cpu_list_lock.
  * @created: Indicates whether the CPU thread has been successfully created.
+ * @secondary_tcg: Indicates that this CPU executes through secondary TCG.
+ * @secondary_tcg_tlb_flush_pending: A topology change requires a TLB flush
+ *   on the secondary TCG thread.
  * @halt_cond: condition variable sleeping threads can wait on.
  * @exit_request: Another thread requests the CPU to call qemu_process_cpu_events().
  *   Should be read only by CPU thread with load-acquire, to synchronize with
@@ -494,6 +497,8 @@ struct CPUState {
     struct QemuCond *halt_cond;
     bool thread_kicked;
     bool created;
+    bool secondary_tcg;
+    bool secondary_tcg_tlb_flush_pending;
     bool stop;
     bool stopped;
 

@@ -778,7 +778,7 @@ void cpu_address_space_init(CPUState *cpu, int asidx,
     newas = &cpu->cpu_ases[asidx];
     newas->cpu = cpu;
     newas->as = as;
-    if (tcg_enabled()) {
+    if (tcg_enabled() || cpu->secondary_tcg) {
         newas->tcg_as_listener.log_global_after_sync = tcg_log_global_after_sync;
         newas->tcg_as_listener.commit = tcg_commit;
         newas->tcg_as_listener.name = "tcg";
@@ -802,7 +802,7 @@ void cpu_destroy_address_spaces(CPUState *cpu)
             /* This index was never initialized; no deinit needed */
             continue;
         }
-        if (tcg_enabled()) {
+        if (tcg_enabled() || cpu->secondary_tcg) {
             memory_listener_unregister(&cpuas->tcg_as_listener);
         }
         g_clear_pointer(&cpuas->as, address_space_destroy_free);
@@ -3082,11 +3082,24 @@ static void tcg_commit(MemoryListener *listener)
     CPUAddressSpace *cpuas;
     CPUState *cpu;
 
-    assert(tcg_enabled());
     /* since each CPU stores ram addresses in its TLB cache, we must
        reset the modified entries */
     cpuas = container_of(listener, CPUAddressSpace, tcg_as_listener);
     cpu = cpuas->cpu;
+    assert(tcg_enabled() || cpu->secondary_tcg);
+
+    if (cpu->secondary_tcg) {
+        if (current_cpu == cpu) {
+            tlb_flush(cpu);
+        } else {
+            qatomic_set(&cpu->secondary_tcg_tlb_flush_pending, true);
+            if (cpu->thread_id) {
+                qatomic_store_release(&cpu->exit_request, true);
+                tcg_secondary_cpu_kick(cpu);
+            }
+        }
+        return;
+    }
 
     /*
      * Queueing the work function will kick the cpu back to
