@@ -394,6 +394,18 @@ void helper_rdmsr(CPUX86State *env)
     case MSR_SMI_COUNT:
         val = env->msr_smi_count;
         break;
+    case MSR_IA32_SMBASE:
+        if (!IS_INTEL_CPU(env)) {
+            raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
+        }
+        val = env->smbase;
+        break;
+    case MSR_AMD_SMBASE:
+        if (!IS_AMD_CPU(env)) {
+            raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
+        }
+        val = env->smbase;
+        break;
     case MSR_MTRRphysBase(0):
     case MSR_MTRRphysBase(1):
     case MSR_MTRRphysBase(2):

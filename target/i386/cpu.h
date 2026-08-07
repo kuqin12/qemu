@@ -568,6 +568,9 @@ typedef enum X86Seg {
 
 #define MSR_K7_HWCR                     0xc0010015
 
+/* AMD SMM_BASE: AMD's equivalent of Intel's IA32_SMBASE (0x9e) */
+#define MSR_AMD_SMBASE                  0xc0010111
+
 #define MSR_VM_HSAVE_PA                 0xc0010117
 
 #define MSR_IA32_XFD                    0x000001c4
