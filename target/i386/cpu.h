@@ -451,15 +451,30 @@ typedef enum X86Seg {
 
 #define MSR_P6_PERFCTR0                 0xc1
 
+#define MSR_IA32_SMM_MONITOR_CTL        0x9b
+/* Valid (bit 0), BlockSmi (bit 2) and MsegBase (bits 31:12); rest reserved */
+#define MSR_IA32_SMM_MONITOR_CTL_MASK   0xfffff005
 #define MSR_IA32_SMBASE                 0x9e
 #define MSR_SMI_COUNT                   0x34
 #define MSR_CORE_THREAD_COUNT           0x35
+
+/* SMM Code Access Check capability/control (Intel SDM Vol. 4) */
+#define MSR_SMM_MCA_CAP                 0x17d
+#define MSR_SMM_MCA_CAP_SMM_CODE_ACCESS_CHK (1ULL << 58)
+#define MSR_SMM_FEATURE_CONTROL         0x4e0
+
 #define MSR_MTRRcap                     0xfe
 #define MSR_MTRR_MEM_TYPE_WB            0x06
 #define MSR_MTRRcap_VCNT                8
 #define MSR_MTRRcap_FIXRANGE_SUPPORT    (1 << 8)
 #define MSR_MTRRcap_WC_SUPPORTED        (1 << 10)
+#define MSR_MTRRcap_SMRR_SUPPORT        (1 << 11)
+#define MSR_MTRRcap_SMRR_EXT_SUPPORT    (1 << 14)
 #define MSR_MTRR_ENABLE                 (1 << 11)
+
+/* System Management Range Registers, guarding SMRAM from non-SMM accesses */
+#define MSR_SMRR_PHYSBASE               0x1f2
+#define MSR_SMRR_PHYSMASK               0x1f3
 
 #define MSR_IA32_SYSENTER_CS            0x174
 #define MSR_IA32_SYSENTER_ESP           0x175
@@ -2118,6 +2133,10 @@ typedef struct CPUArchState {
     uint64_t pat;
     uint32_t smbase;
     uint64_t msr_smi_count;
+    uint64_t msr_smm_monitor_ctl;
+    uint64_t msr_smrr_physbase;
+    uint64_t msr_smrr_physmask;
+    uint64_t msr_smm_feature_control;
 
     uint32_t pkru;
     uint32_t pkrs;

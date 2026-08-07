@@ -286,6 +286,29 @@ void helper_wrmsr(CPUX86State *env)
     case MSR_TSC_AUX:
         env->tsc_aux = val;
         break;
+    case MSR_IA32_SMM_MONITOR_CTL:
+        /*
+         * IA32_SMM_MONITOR_CTL holds the MSEG base programmed by firmware.
+         * Only Valid (bit 0), BlockSmi (bit 2) and MsegBase (bits 31:12) are
+         * defined; the rest are reserved and are dropped here rather than
+         * raising #GP. TCG does not emulate the dual-monitor treatment - this
+         * is storage only, so firmware can read back what it wrote.
+         */
+        env->msr_smm_monitor_ctl = val & MSR_IA32_SMM_MONITOR_CTL_MASK;
+        break;
+    case MSR_SMRR_PHYSBASE:
+        env->msr_smrr_physbase = val;
+        break;
+    case MSR_SMRR_PHYSMASK:
+        env->msr_smrr_physmask = val;
+        break;
+    case MSR_SMM_FEATURE_CONTROL:
+        /*
+         * Storage only: TCG does not enforce SMM Code Access Check, so the
+         * lock bit is recorded rather than acted upon.
+         */
+        env->msr_smm_feature_control = val;
+        break;
     case MSR_IA32_MISC_ENABLE:
         env->msr_ia32_misc_enable = val;
         break;
@@ -406,6 +429,26 @@ void helper_rdmsr(CPUX86State *env)
         }
         val = env->smbase;
         break;
+    case MSR_IA32_SMM_MONITOR_CTL:
+        val = env->msr_smm_monitor_ctl;
+        break;
+    case MSR_SMRR_PHYSBASE:
+        val = env->msr_smrr_physbase;
+        break;
+    case MSR_SMRR_PHYSMASK:
+        val = env->msr_smrr_physmask;
+        break;
+    case MSR_SMM_FEATURE_CONTROL:
+        val = env->msr_smm_feature_control;
+        break;
+    case MSR_SMM_MCA_CAP:
+        /*
+         * Report SMM Code Access Check as available so firmware will program
+         * MSR_SMM_FEATURE_CONTROL. TCG stores that control but does not
+         * actually police code fetches outside the SMRR range.
+         */
+        val = MSR_SMM_MCA_CAP_SMM_CODE_ACCESS_CHK;
+        break;
     case MSR_MTRRphysBase(0):
     case MSR_MTRRphysBase(1):
     case MSR_MTRRphysBase(2):
@@ -453,7 +496,8 @@ void helper_rdmsr(CPUX86State *env)
     case MSR_MTRRcap:
         if (env->features[FEAT_1_EDX] & CPUID_MTRR) {
             val = MSR_MTRRcap_VCNT | MSR_MTRRcap_FIXRANGE_SUPPORT |
-                MSR_MTRRcap_WC_SUPPORTED;
+                MSR_MTRRcap_WC_SUPPORTED | MSR_MTRRcap_SMRR_SUPPORT |
+                MSR_MTRRcap_SMRR_EXT_SUPPORT;
         } else {
             /* XXX: exception? */
             val = 0;

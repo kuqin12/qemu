@@ -899,15 +899,25 @@ void x86_cpu_vendor_words2str(char *dst, uint32_t vendor1,
 #else
 #define CPUID_EXT_KERNEL_FEATURES 0
 #endif
+/*
+ * CPUID_EXT_VMX is advertised only so that firmware which gates SMM/MSEG
+ * initialization on CPUID.01H:ECX.VMX (bit 5) can run under TCG. It is not
+ * enabled by any CPU model and must be requested explicitly, e.g.
+ * "-cpu qemu64,vendor=GenuineIntel,vmx=on".
+ *
+ * TCG does NOT emulate VMX: VMXON and the other VMX instructions still raise
+ * #UD, and the VMX capability MSRs (0x480-0x491) read as zero.
+ */
 #define TCG_EXT_FEATURES (CPUID_EXT_SSE3 | CPUID_EXT_PCLMULQDQ | \
           CPUID_EXT_MONITOR | CPUID_EXT_SSSE3 | CPUID_EXT_CX16 | \
           CPUID_EXT_SSE41 | CPUID_EXT_SSE42 | CPUID_EXT_POPCNT | \
           CPUID_EXT_XSAVE | /* CPUID_EXT_OSXSAVE is dynamic */   \
           CPUID_EXT_MOVBE | CPUID_EXT_AES | CPUID_EXT_HYPERVISOR | \
           CPUID_EXT_RDRAND | CPUID_EXT_AVX | CPUID_EXT_F16C | \
+          CPUID_EXT_VMX | \
           CPUID_EXT_FMA | CPUID_EXT_X2APIC | CPUID_EXT_KERNEL_FEATURES)
           /* missing:
-          CPUID_EXT_DTES64, CPUID_EXT_DSCPL, CPUID_EXT_VMX, CPUID_EXT_SMX,
+          CPUID_EXT_DTES64, CPUID_EXT_DSCPL, CPUID_EXT_SMX,
           CPUID_EXT_EST, CPUID_EXT_TM2, CPUID_EXT_CID,
           CPUID_EXT_XTPR, CPUID_EXT_PDCM, CPUID_EXT_PCID, CPUID_EXT_DCA,
           CPUID_EXT_TSC_DEADLINE_TIMER

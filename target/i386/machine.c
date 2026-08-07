@@ -601,6 +601,47 @@ static const VMStateDescription vmstate_msr_smi_count = {
     }
 };
 
+static bool msr_smm_monitor_ctl_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+    CPUX86State *env = &cpu->env;
+
+    return env->msr_smm_monitor_ctl != 0;
+}
+
+static const VMStateDescription vmstate_msr_smm_monitor_ctl = {
+    .name = "cpu/msr_smm_monitor_ctl",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = msr_smm_monitor_ctl_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(env.msr_smm_monitor_ctl, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool msr_smrr_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+    CPUX86State *env = &cpu->env;
+
+    return env->msr_smrr_physbase != 0 || env->msr_smrr_physmask != 0 ||
+           env->msr_smm_feature_control != 0;
+}
+
+static const VMStateDescription vmstate_msr_smrr = {
+    .name = "cpu/msr_smrr",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = msr_smrr_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(env.msr_smrr_physbase, X86CPU),
+        VMSTATE_UINT64(env.msr_smrr_physmask, X86CPU),
+        VMSTATE_UINT64(env.msr_smm_feature_control, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static bool tscdeadline_needed(void *opaque)
 {
     X86CPU *cpu = opaque;
@@ -1884,6 +1925,8 @@ const VMStateDescription vmstate_x86_cpu = {
         &vmstate_umwait,
         &vmstate_tsc_khz,
         &vmstate_msr_smi_count,
+        &vmstate_msr_smm_monitor_ctl,
+        &vmstate_msr_smrr,
         &vmstate_pkru,
         &vmstate_pkrs,
         &vmstate_spec_ctrl,
