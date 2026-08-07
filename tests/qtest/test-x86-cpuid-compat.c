@@ -271,6 +271,11 @@ static const CpuidTestArgs cpuid_tests[] = {
         "x86/cpuid/auto-level/phenom/xsaveopt",
         "phenom", "xsaveopt=on", NULL, "level", 0xd,
     },
+    /* A configured TSC frequency is enumerated through CPUID[0x15]. */
+    {
+        "x86/cpuid/auto-level/qemu64/tsc-frequency",
+        "qemu64", "tsc-frequency=1000000000", NULL, "level", 0x15,
+    },
     /* CPUID[8000_0001].EDX: */
     {
         "x86/cpuid/auto-xlevel/486/3dnow",

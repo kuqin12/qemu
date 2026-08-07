@@ -7715,7 +7715,7 @@ static void x86_cpuid_set_tsc_freq(Object *obj, Visitor *v, const char *name,
                                    void *opaque, Error **errp)
 {
     X86CPU *cpu = X86_CPU(obj);
-    const int64_t max = INT64_MAX;
+    const int64_t max = (int64_t)UINT32_MAX * 1000;
     int64_t value;
 
     if (!visit_type_int(v, name, &value, errp)) {
@@ -8990,6 +8990,21 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         }
         break;
     }
+    case 0x15:
+        /*
+         * TSC/Crystal Clock Information Leaf.  When tsc-frequency is set,
+         * TCG scales the TSC to that frequency.  Model a 1 MHz crystal and
+         * use the configured kHz value as an exact numerator.
+         */
+        if (!env->tsc_khz) {
+            *eax = *ebx = *ecx = *edx = 0;
+            break;
+        }
+        *eax = 1000;
+        *ebx = (uint32_t)env->tsc_khz;
+        *ecx = 1000000;
+        *edx = 0;
+        break;
     case 0x1C: /* Last Branch Records Information Leaf */
         *eax = 0;
         *ebx = 0;
@@ -9835,6 +9850,11 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
     /* Intel Processor Trace requires CPUID[0x14] */
     if ((env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_INTEL_PT)) {
         x86_cpu_adjust_level(cpu, &cpu->env.cpuid_min_level, 0x14);
+    }
+
+    /* A configured TSC frequency is enumerated through CPUID[0x15]. */
+    if (env->tsc_khz) {
+        x86_cpu_adjust_level(cpu, &env->cpuid_min_level, 0x15);
     }
 
     /*

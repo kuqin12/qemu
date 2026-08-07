@@ -21,6 +21,8 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "system/tcg.h"
 #include "system/whpx.h"
 #include "system/cpu-timers.h"
 #include "trace.h"
@@ -34,6 +36,11 @@
 /* TSC handling */
 uint64_t cpu_get_tsc(CPUX86State *env)
 {
+    if (tcg_enabled() && env->tsc_khz) {
+        return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                        env->tsc_khz, 1000000);
+    }
+
     return cpus_get_elapsed_ticks();
 }
 
