@@ -1115,8 +1115,11 @@ static void build_fadt_rev6(GArray *table_data, BIOSLinker *linker,
         fadt.arm_boot_arch = 0;
         break;
     case QEMU_PSCI_CONDUIT_HVC:
-        fadt.arm_boot_arch = ACPI_FADT_ARM_PSCI_COMPLIANT |
-                             ACPI_FADT_ARM_PSCI_USE_HVC;
+        fadt.arm_boot_arch = ACPI_FADT_ARM_PSCI_COMPLIANT;
+        /* Hybrid guests use SMC to reach their emulated secure world. */
+        if (!vms->hybrid_secure) {
+            fadt.arm_boot_arch |= ACPI_FADT_ARM_PSCI_USE_HVC;
+        }
         break;
     case QEMU_PSCI_CONDUIT_SMC:
         fadt.arm_boot_arch = ACPI_FADT_ARM_PSCI_COMPLIANT;
