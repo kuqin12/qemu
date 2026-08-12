@@ -171,6 +171,7 @@ struct VirtMachineState {
     bool hybrid_kvm_handoff_ready;
     bool hybrid_kvm_handoff_pending;
     bool hybrid_initial_reset_done;
+    bool hybrid_warm_reset_pending;
     bool hybrid_shadow_worker_created;
     bool hybrid_shadow_worker_alive;
     bool hybrid_shadow_worker_request;
@@ -187,6 +188,9 @@ struct VirtMachineState {
     int hybrid_runtime_result;
     uint64_t hybrid_bl33_xregs[31];
     int hybrid_shadow_stop_reason;
+    MemoryRegion *hybrid_secure_ram;
+    MemoryRegion *hybrid_tag_ram;
+    MemoryRegion *hybrid_secure_tag_ram;
     bool highmem;
     bool highmem_compact;
     bool highmem_cxl;

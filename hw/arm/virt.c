@@ -47,6 +47,7 @@
 #include "system/tpm.h"
 #include "system/tcg.h"
 #include "system/kvm.h"
+#include "system/ramblock.h"
 #include "system/hvf.h"
 #include "system/whpx.h"
 #include "system/qtest.h"
@@ -2388,14 +2389,15 @@ static void create_platform_bus(VirtMachineState *vms)
     }
 }
 
-static void create_tag_ram(MemoryRegion *tag_sysmem,
-                           hwaddr base, hwaddr size,
-                           const char *name)
+static MemoryRegion *create_tag_ram(MemoryRegion *tag_sysmem,
+                                    hwaddr base, hwaddr size,
+                                    const char *name)
 {
     MemoryRegion *tagram = g_new(MemoryRegion, 1);
 
     memory_region_init_ram(tagram, NULL, name, size / 32, &error_fatal);
     memory_region_add_subregion(tag_sysmem, base / 32, tagram);
+    return tagram;
 }
 
 static void create_secure_ram(VirtMachineState *vms,
@@ -2411,6 +2413,9 @@ static void create_secure_ram(VirtMachineState *vms,
     memory_region_init_ram(secram, NULL, "virt.secure-ram", size,
                            &error_fatal);
     memory_region_add_subregion(secure_sysmem, base, secram);
+    if (vms->hybrid_secure) {
+        vms->hybrid_secure_ram = secram;
+    }
 
     nodename = g_strdup_printf("/secram@%" PRIx64, base);
     qemu_fdt_add_subnode(ms->fdt, nodename);
@@ -2420,13 +2425,20 @@ static void create_secure_ram(VirtMachineState *vms,
     qemu_fdt_setprop_string(ms->fdt, nodename, "secure-status", "okay");
 
     if (secure_tag_sysmem) {
-        create_tag_ram(secure_tag_sysmem, base, size, "mach-virt.secure-tag");
+        MemoryRegion *tagram = create_tag_ram(
+            secure_tag_sysmem, base, size, "mach-virt.secure-tag");
+
+        if (vms->hybrid_secure) {
+            vms->hybrid_secure_tag_ram = tagram;
+        }
     }
 
     g_free(nodename);
 }
 
 static void virt_hybrid_runtime_execute(VirtMachineState *vms);
+static void virt_hybrid_shadow_boot(VirtMachineState *vms,
+                                    bool firmware_loaded);
 
 static hwaddr virt_hybrid_bl33_entry(const VirtMachineState *vms)
 {
@@ -2671,6 +2683,25 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
     return ret;
 }
 
+int arm_hybrid_system_reset(bool warm)
+{
+    VirtMachineState *vms;
+
+    if (!current_machine ||
+        !object_dynamic_cast(OBJECT(current_machine), TYPE_VIRT_MACHINE)) {
+        return -ENOTSUP;
+    }
+
+    vms = VIRT_MACHINE(current_machine);
+    if (!vms->hybrid_secure) {
+        return -ENOTSUP;
+    }
+
+    qatomic_set(&vms->hybrid_warm_reset_pending, warm);
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    return 0;
+}
+
 static void virt_hybrid_kvm_handoff_reset(void *opaque)
 {
     VirtMachineState *vms = opaque;
@@ -2693,22 +2724,90 @@ static void virt_hybrid_kvm_handoff_reset(void *opaque)
     vms->hybrid_kvm_handoff_ready = true;
 }
 
+static void virt_hybrid_discard_ram(MemoryRegion *mr)
+{
+    RAMBlock *ram_block;
+    ram_addr_t length;
+
+    if (!mr) {
+        return;
+    }
+
+    ram_block = mr->ram_block;
+    if (!ram_block) {
+        error_report("mach-virt: %s has no RAM backing for cold reset",
+                     memory_region_name(mr));
+        exit(1);
+    }
+    length = qemu_ram_get_used_length(ram_block);
+    if (!length) {
+        return;
+    }
+    if (ram_block_discard_range(ram_block, 0, length)) {
+        error_report("mach-virt: failed to clear %s for cold reset",
+                     memory_region_name(mr));
+        exit(1);
+    }
+}
+
+static void virt_hybrid_cold_reset_ram(VirtMachineState *vms)
+{
+    virt_hybrid_discard_ram(MACHINE(vms)->ram);
+    virt_hybrid_discard_ram(vms->hybrid_secure_ram);
+    virt_hybrid_discard_ram(vms->hybrid_tag_ram);
+    virt_hybrid_discard_ram(vms->hybrid_secure_tag_ram);
+}
+
+static bool virt_hybrid_shadow_prepare_reset(VirtMachineState *vms)
+{
+    bool ready;
+
+    qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    ready = vms->hybrid_shadow_worker_alive &&
+        !vms->hybrid_shadow_worker_request &&
+        !vms->hybrid_runtime_inflight;
+    qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+
+    if (!ready) {
+        error_report("mach-virt: hybrid secure worker is unavailable for "
+                     "reset");
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
+    }
+    return ready;
+}
+
 static void virt_machine_reset(MachineState *machine, ResetType type)
 {
     VirtMachineState *vms = VIRT_MACHINE(machine);
+    bool reboot = vms->hybrid_initial_reset_done;
+    bool warm = reboot &&
+        qatomic_xchg(&vms->hybrid_warm_reset_pending, false);
 
     if (!vms->hybrid_secure) {
         qemu_devices_reset(type);
         return;
     }
 
-    if (vms->hybrid_initial_reset_done) {
-        error_report("mach-virt: hybrid-secure does not support reset");
-        vm_stop(RUN_STATE_INTERNAL_ERROR);
+    if (reboot && !virt_hybrid_shadow_prepare_reset(vms)) {
         return;
     }
 
+    if (reboot && !warm) {
+        virt_hybrid_cold_reset_ram(vms);
+    }
+
     qemu_devices_reset(type);
+
+    if (reboot) {
+        cpu_reset(vms->hybrid_shadow_cpu);
+        device_cold_reset(vms->hybrid_secure_gic);
+        vms->hybrid_shadow_bootstrap_passed = false;
+        vms->hybrid_kvm_handoff_ready = false;
+        virt_hybrid_shadow_boot(vms, vms->bootinfo.firmware_loaded);
+        vms->hybrid_kvm_handoff_pending =
+            vms->hybrid_shadow_bootstrap_passed;
+    }
+
     virt_hybrid_kvm_handoff_reset(vms);
     vms->hybrid_initial_reset_done = true;
 }
@@ -3744,8 +3843,13 @@ static void machvirt_init(MachineState *machine)
     }
 
     if (tag_sysmem) {
-        create_tag_ram(tag_sysmem, vms->memmap[VIRT_MEM].base,
-                       machine->ram_size, "mach-virt.tag");
+        MemoryRegion *tagram = create_tag_ram(
+            tag_sysmem, vms->memmap[VIRT_MEM].base,
+            machine->ram_size, "mach-virt.tag");
+
+        if (vms->hybrid_secure) {
+            vms->hybrid_tag_ram = tagram;
+        }
     }
 
     vms->highmem_ecam &= (!firmware_loaded || aarch64);
