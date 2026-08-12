@@ -345,6 +345,14 @@ static void bochs_display_exit(PCIDevice *dev)
     qemu_graphic_console_close(s->con);
 }
 
+static void bochs_display_reset(DeviceState *dev)
+{
+    BochsDisplayState *s = BOCHS_DISPLAY(dev);
+
+    memset(s->vbe_regs, 0, sizeof(s->vbe_regs));
+    memset(&s->mode, 0, sizeof(s->mode));
+}
+
 static const Property bochs_display_properties[] = {
     DEFINE_PROP_SIZE("vgamem", BochsDisplayState, vgamem, 16 * MiB),
     DEFINE_PROP_BOOL("edid", BochsDisplayState, enable_edid, true),
@@ -364,6 +372,7 @@ static void bochs_display_class_init(ObjectClass *klass, const void *data)
     k->romfile   = "vgabios-bochs-display.bin";
     k->exit      = bochs_display_exit;
     dc->vmsd     = &vmstate_bochs_display;
+    device_class_set_legacy_reset(dc, bochs_display_reset);
     device_class_set_props(dc, bochs_display_properties);
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
