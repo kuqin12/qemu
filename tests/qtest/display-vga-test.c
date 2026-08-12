@@ -9,6 +9,8 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "libqos/pci-pc.h"
+#include "hw/display/bochs-vbe.h"
 
 static void pci_multihead(void)
 {
@@ -23,6 +25,49 @@ static void test_vga(gconstpointer data)
     QTestState *qts;
 
     qts = qtest_initf("-vga none -device %s", (const char *)data);
+    qtest_quit(qts);
+}
+
+static void test_bochs_display_reset(void)
+{
+    QTestState *qts;
+    QPCIBus *bus;
+    QPCIDevice *dev;
+    QPCIBar bar;
+
+    qts = qtest_init("-vga none -device bochs-display,addr=04.0");
+    bus = qpci_new_pc(qts, NULL);
+    dev = qpci_device_find(bus, QPCI_DEVFN(4, 0));
+    g_assert_nonnull(dev);
+    qpci_device_enable(dev);
+    bar = qpci_iomap(dev, 2, NULL);
+
+    qpci_io_writew(dev, bar, PCI_VGA_BOCHS_OFFSET +
+                   VBE_DISPI_INDEX_XRES * 2, 1024);
+    qpci_io_writew(dev, bar, PCI_VGA_BOCHS_OFFSET +
+                   VBE_DISPI_INDEX_YRES * 2, 768);
+    qpci_io_writew(dev, bar, PCI_VGA_BOCHS_OFFSET +
+                   VBE_DISPI_INDEX_BPP * 2, 32);
+    qpci_io_writew(dev, bar, PCI_VGA_BOCHS_OFFSET +
+                   VBE_DISPI_INDEX_ENABLE * 2, VBE_DISPI_ENABLED);
+
+    qpci_iounmap(dev, bar);
+    qtest_system_reset(qts);
+    qpci_device_enable(dev);
+    bar = qpci_iomap(dev, 2, NULL);
+
+    g_assert_cmphex(qpci_io_readw(dev, bar, PCI_VGA_BOCHS_OFFSET +
+                                 VBE_DISPI_INDEX_XRES * 2), ==, 0);
+    g_assert_cmphex(qpci_io_readw(dev, bar, PCI_VGA_BOCHS_OFFSET +
+                                 VBE_DISPI_INDEX_YRES * 2), ==, 0);
+    g_assert_cmphex(qpci_io_readw(dev, bar, PCI_VGA_BOCHS_OFFSET +
+                                 VBE_DISPI_INDEX_BPP * 2), ==, 0);
+    g_assert_cmphex(qpci_io_readw(dev, bar, PCI_VGA_BOCHS_OFFSET +
+                                 VBE_DISPI_INDEX_ENABLE * 2), ==, 0);
+
+    qpci_iounmap(dev, bar);
+    g_free(dev);
+    qpci_free_pc(bus);
     qtest_quit(qts);
 }
 
@@ -48,6 +93,10 @@ int main(int argc, char **argv)
 
     if (qtest_has_device("secondary-vga")) {
         qtest_add_func("/display/pci/multihead", pci_multihead);
+    }
+    if (qtest_has_device("bochs-display")) {
+        qtest_add_func("/display/pci/bochs-display/reset",
+                       test_bochs_display_reset);
     }
 
     return g_test_run();

@@ -6,8 +6,13 @@
 .equ UARTFR,            0x018
 
 .equ STACK_TOP,         0x48000000
+.equ REBOOT_COUNTER,    0x49000000
 
 .equ PSCI_SYSTEM_OFF,   0x84000008
+#ifndef PSCI_RESET_FID
+#define PSCI_RESET_FID 0x84000009
+#endif
+.equ PSCI_SYSTEM_RESET, PSCI_RESET_FID
 .equ FFA_VERSION,       0x84000063
 .equ FFA_VERSION_1_2,   0x00010002
 .equ FFA_ERROR,         0x84000060
@@ -97,6 +102,61 @@ version_succeeded:
     b.ne failed
 #endif
 
+#ifdef EXPECT_RESET_REJECT
+    ldr x0, =PSCI_SYSTEM_RESET
+    mov x1, #1
+    smc #0
+    sxtw x20, w0
+    mov x21, #0
+    mov x22, #0
+    mov x23, #0
+    ldr x1, =0xfffffffffffffffe
+    cmp x20, x1
+    b.eq passed
+    b failed
+#endif
+
+#ifdef EXPECT_COLD_RESET
+    ldr x0, =REBOOT_COUNTER
+    ldr x1, [x0]
+    cbnz x1, failed
+    mov x1, #1
+    str x1, [x0]
+    dsb sy
+    ldr x0, =cold_ready
+    bl puts
+#ifdef EXPECT_GUEST_COLD_RESET
+    mrs x2, cntpct_el0
+    mrs x3, cntfrq_el0
+    add x2, x2, x3
+guest_cold_delay:
+    mrs x3, cntpct_el0
+    cmp x3, x2
+    b.lo guest_cold_delay
+    ldr x0, =PSCI_SYSTEM_RESET
+    mov x1, #0
+    smc #0
+    b .
+#endif
+cold_wait:
+    wfi
+    b cold_wait
+#endif
+
+#ifdef EXPECT_REBOOT
+    ldr x0, =REBOOT_COUNTER
+    ldr x1, [x0]
+    cmp x1, #REBOOT_COUNT
+    b.hs passed
+    add x1, x1, #1
+    str x1, [x0]
+    dsb sy
+    ldr x0, =PSCI_SYSTEM_RESET
+    mov x1, #0
+    smc #0
+    b .
+#endif
+
 passed:
     ldr x0, =pass
     bl puts
@@ -169,4 +229,7 @@ fail: .asciz "HYBRID FFA TIMEOUT FAIL "
 #else
 pass: .asciz "HYBRID FFA RUNTIME PASS\n"
 fail: .asciz "HYBRID FFA RUNTIME FAIL "
+#endif
+#ifdef EXPECT_COLD_RESET
+cold_ready: .asciz "HYBRID FFA COLD READY\n"
 #endif

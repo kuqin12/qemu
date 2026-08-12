@@ -8,7 +8,24 @@ secure_flash=${SECURE_FLASH:?Set SECURE_FLASH to SECURE_FLASH0.fd}
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
 
+defines=()
+expected_calls=1
+expected_resets=0
+if [[ "${EXPECT_RESET_REJECT:-0}" == 1 ]]; then
+    reset_fid=${PSCI_RESET_FID:-0x84000012}
+    defines+=(-DEXPECT_RESET_REJECT "-DPSCI_RESET_FID=$reset_fid")
+fi
+if [[ "${EXPECT_REBOOT:-0}" == 1 ]]; then
+    reboot_count=${REBOOT_COUNT:-4}
+    reset_fid=${PSCI_RESET_FID:-0x84000009}
+    defines+=(-DEXPECT_REBOOT "-DREBOOT_COUNT=$reboot_count"
+              "-DPSCI_RESET_FID=$reset_fid")
+    expected_calls=$((reboot_count + 1))
+    expected_resets=$reboot_count
+fi
+
 "${CC:-cc}" -c -nostdlib -ffreestanding -march=armv8-a \
+    "${defines[@]}" \
     "$root_dir/tests/arm-kvm/hybrid-ffa-runtime.S" \
     -o "$work_dir/hybrid-ffa-runtime.o"
 "${LD:-ld}" -nostdlib \
@@ -49,19 +66,23 @@ timeout --kill-after=5s 30s "$qemu" \
     -monitor none \
     -serial "file:$normal_log" \
     -serial "file:$secure_log" \
-    -trace "enable=kvm_arm_ffa_stub,file=$trace_log"
+    -trace "enable=kvm_arm_*,file=$trace_log"
 status=$?
 set -e
 
 pass_count=$(grep -c '^HYBRID FFA RUNTIME PASS$' "$normal_log" || true)
 trace_count=$(grep -c '^kvm_arm_ffa_stub cpu 0 function 0xc400008d ' "$trace_log" || true)
 direct_count=$(grep -c 'MsgSendDirectReq2' "$normal_log" || true)
+reset_count=$(grep -c \
+    '^kvm_arm_psci_system_reset cpu 0 function ' "$trace_log" || true)
 
-printf 'pass=%d kvm_exit=%d mssp_direct=%d\n' \
-    "$pass_count" "$trace_count" "$direct_count"
+printf 'pass=%d kvm_exit=%d mssp_direct=%d reset=%d\n' \
+    "$pass_count" "$trace_count" "$direct_count" "$reset_count"
 
-if [[ "$status" -ne 0 || "$pass_count" -ne 1 || "$trace_count" -ne 1 ||
-    "$direct_count" -lt 1 ]]; then
+if [[ "$status" -ne 0 || "$pass_count" -ne 1 ||
+    "$trace_count" -ne "$expected_calls" ||
+    "$direct_count" -lt "$expected_calls" ||
+    "$reset_count" -ne "$expected_resets" ]]; then
     printf 'qemu_status=%d\n' "$status"
     cat "$trace_log"
     tail -n 160 "$normal_log"
