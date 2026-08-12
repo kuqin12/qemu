@@ -172,6 +172,8 @@ struct VirtMachineState {
     bool hybrid_kvm_handoff_pending;
     bool hybrid_initial_reset_done;
     bool hybrid_warm_reset_pending;
+    bool hybrid_psci_reset_inflight;
+    bool hybrid_psci_reset_requested;
     bool hybrid_shadow_worker_created;
     bool hybrid_shadow_worker_alive;
     bool hybrid_shadow_worker_request;

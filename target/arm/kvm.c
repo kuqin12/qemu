@@ -22,6 +22,7 @@
 #include "qapi/error.h"
 #include "system/system.h"
 #include "system/runstate.h"
+#include "system/cpus.h"
 #include "system/ramblock.h"
 #include "system/kvm.h"
 #include "system/kvm_int.h"
@@ -61,12 +62,11 @@ static bool cap_has_inject_ext_dabt;
 #define KVM_ARM_FFA_BUSY (UINT32_MAX - 3)
 #define KVM_ARM_FFA_ABORTED (UINT32_MAX - 7)
 #define KVM_ARM_PSCI_SYSTEM_RESET 0x84000009
+#define KVM_ARM_PSCI_FEATURES 0x8400000a
 #define KVM_ARM_PSCI_SYSTEM_RESET2 0x84000012
 #define KVM_ARM_PSCI_SYSTEM_RESET2_64 0xc4000012
 #define KVM_ARM_PSCI_RESET2_SYSTEM_WARM_RESET 0
-#define KVM_ARM_PSCI_RESET2_TYPE_VENDOR BIT(31)
 #define KVM_ARM_PSCI_RET_NOT_SUPPORTED (-1)
-#define KVM_ARM_PSCI_RET_INVALID_PARAMS (-2)
 
 /**
  * ARMHostCPUFeatures: information about the host CPU (identified
@@ -663,6 +663,13 @@ static int kvm_arm_init_ffa_forwarding(KVMState *s)
     ret = kvm_arm_set_smccc_filter(s, KVM_ARM_PSCI_SYSTEM_RESET, 1);
     if (ret) {
         error_report("Failed to install KVM PSCI SYSTEM_RESET filter: %s",
+                     strerror(-ret));
+        return ret;
+    }
+
+    ret = kvm_arm_set_smccc_filter(s, KVM_ARM_PSCI_FEATURES, 1);
+    if (ret) {
+        error_report("Failed to install KVM PSCI FEATURES filter: %s",
                      strerror(-ret));
         return ret;
     }
@@ -1666,6 +1673,7 @@ static int kvm_arm_handle_smccc_hypercall(CPUState *cs, struct kvm_run *run)
         !(run->hypercall.flags & KVM_HYPERCALL_EXIT_SMC) ||
         (!kvm_arm_is_ffa_call(func_id) &&
          func_id != KVM_ARM_PSCI_SYSTEM_RESET &&
+         func_id != KVM_ARM_PSCI_FEATURES &&
          func_id != KVM_ARM_PSCI_SYSTEM_RESET2 &&
          func_id != KVM_ARM_PSCI_SYSTEM_RESET2_64)) {
         error_report("Unexpected Arm KVM hypercall exit: function 0x%" PRIx64
@@ -1677,39 +1685,63 @@ static int kvm_arm_handle_smccc_hypercall(CPUState *cs, struct kvm_run *run)
     if (func_id == KVM_ARM_PSCI_SYSTEM_RESET ||
         func_id == KVM_ARM_PSCI_SYSTEM_RESET2 ||
         func_id == KVM_ARM_PSCI_SYSTEM_RESET2_64) {
+        uint64_t regs[18];
         uint32_t reset_type;
         int ret;
 
         kvm_cpu_synchronize_state(cs);
         reset_type = is_a64(env) ? env->xregs[1] : env->regs[1];
-        if (func_id != KVM_ARM_PSCI_SYSTEM_RESET &&
-            reset_type != KVM_ARM_PSCI_RESET2_SYSTEM_WARM_RESET) {
-            ret = reset_type & KVM_ARM_PSCI_RESET2_TYPE_VENDOR ?
-                KVM_ARM_PSCI_RET_NOT_SUPPORTED :
-                KVM_ARM_PSCI_RET_INVALID_PARAMS;
-            if (is_a64(env)) {
-                env->xregs[0] = ret;
-            } else {
-                env->regs[0] = ret;
-            }
-            run->hypercall.ret = ret;
+        if (!is_a64(env)) {
+            env->regs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
+            run->hypercall.ret = env->regs[0];
             return 0;
         }
 
-        trace_kvm_arm_psci_system_reset(cs->cpu_index, func_id,
-                                        func_id != KVM_ARM_PSCI_SYSTEM_RESET);
+        memcpy(regs, env->xregs, sizeof(regs));
         ret = arm_hybrid_system_reset(
-            func_id != KVM_ARM_PSCI_SYSTEM_RESET);
-        if (ret) {
-            if (is_a64(env)) {
-                env->xregs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
-            } else {
-                env->regs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
-            }
+            regs, func_id != KVM_ARM_PSCI_SYSTEM_RESET &&
+                  reset_type == KVM_ARM_PSCI_RESET2_SYSTEM_WARM_RESET);
+        if (ret < 0) {
+            env->xregs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
             run->hypercall.ret = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
             return 0;
         }
-        run->hypercall.ret = 0;
+
+        if (ret > 0) {
+            trace_kvm_arm_psci_system_reset(
+                cs->cpu_index, func_id,
+                func_id != KVM_ARM_PSCI_SYSTEM_RESET);
+            cpu_stop_current();
+            run->hypercall.ret = 0;
+            return 0;
+        }
+
+        memcpy(env->xregs, regs, sizeof(regs));
+        run->hypercall.ret = env->xregs[0];
+        return 0;
+    }
+
+    if (func_id == KVM_ARM_PSCI_FEATURES) {
+        uint64_t regs[18];
+        int ret;
+
+        kvm_cpu_synchronize_state(cs);
+        if (!is_a64(env)) {
+            env->regs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
+            run->hypercall.ret = env->regs[0];
+            return 0;
+        }
+
+        memcpy(regs, env->xregs, sizeof(regs));
+        ret = arm_hybrid_ffa_call(regs);
+        if (ret) {
+            env->xregs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
+        } else {
+            memcpy(env->xregs, regs, sizeof(regs));
+        }
+        trace_kvm_arm_psci_features(cs->cpu_index, env->xregs[1],
+                                    env->xregs[0]);
+        run->hypercall.ret = env->xregs[0];
         return 0;
     }
 

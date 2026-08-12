@@ -185,7 +185,8 @@ int tcg_secondary_cpu_exec(CPUState *cpu, const bool *stop_request)
         if (ret == EXCP_ATOMIC) {
             cpu_exec_step_atomic(cpu);
         } else if (ret == EXCP_INTERRUPT) {
-            stop_requested = stop_request && qatomic_read(stop_request);
+            stop_requested = cpu->stopped ||
+                (stop_request && qatomic_read(stop_request));
             qatomic_set(&cpu->exit_request, false);
         }
     } while (!stop_requested &&

@@ -1740,6 +1740,8 @@ static void create_gpio_devices(const VirtMachineState *vms, int gpio,
                                 MemoryRegion *mem)
 {
     char *nodename;
+    DeviceState *gic = vms->hybrid_secure && gpio == VIRT_SECURE_GPIO ?
+        vms->hybrid_secure_gic : vms->gic;
     DeviceState *pl061_dev;
     hwaddr base = vms->memmap[gpio].base;
     hwaddr size = vms->memmap[gpio].size;
@@ -1755,7 +1757,7 @@ static void create_gpio_devices(const VirtMachineState *vms, int gpio,
     s = SYS_BUS_DEVICE(pl061_dev);
     sysbus_realize_and_unref(s, &error_fatal);
     memory_region_add_subregion(mem, base, sysbus_mmio_get_region(s, 0));
-    sysbus_connect_irq(s, 0, qdev_get_gpio_in(vms->gic, irq));
+    sysbus_connect_irq(s, 0, qdev_get_gpio_in(gic, irq));
 
     uint32_t phandle = qemu_fdt_alloc_phandle(ms->fdt);
     nodename = g_strdup_printf("/pl061@%" PRIx64, base);
@@ -2537,6 +2539,7 @@ static void virt_hybrid_runtime_execute(VirtMachineState *vms)
     cpu_set_pc(cs, vms->hybrid_trampoline_addr);
     arm_rebuild_hflags(&cpu->env);
     cs->exception_index = -1;
+        cs->stopped = false;
     cs->halted = false;
 
     ret = tcg_secondary_cpu_exec(cs,
@@ -2546,6 +2549,10 @@ static void virt_hybrid_runtime_execute(VirtMachineState *vms)
     if (qatomic_read(&vms->hybrid_runtime_cancel_requested) &&
         ret == EXCP_INTERRUPT) {
         vms->hybrid_runtime_result = -ETIMEDOUT;
+    } else if (qatomic_read(&vms->hybrid_psci_reset_inflight) &&
+             ret == EXCP_INTERRUPT) {
+        qatomic_set(&vms->hybrid_psci_reset_requested, true);
+        vms->hybrid_runtime_result = 0;
     } else if (ret == EXCP_HLT) {
         memcpy(vms->hybrid_runtime_regs, cpu->env.xregs,
                sizeof(vms->hybrid_runtime_regs));
@@ -2561,6 +2568,7 @@ static void virt_hybrid_runtime_execute(VirtMachineState *vms)
     cpu_set_pc(cs, saved_pc);
     arm_rebuild_hflags(&cpu->env);
     cs->exception_index = -1;
+    cs->stopped = false;
     cs->halted = false;
 }
 
@@ -2683,9 +2691,10 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
     return ret;
 }
 
-int arm_hybrid_system_reset(bool warm)
+int arm_hybrid_system_reset(uint64_t regs[18], bool warm)
 {
     VirtMachineState *vms;
+    int ret;
 
     if (!current_machine ||
         !object_dynamic_cast(OBJECT(current_machine), TYPE_VIRT_MACHINE)) {
@@ -2698,8 +2707,14 @@ int arm_hybrid_system_reset(bool warm)
     }
 
     qatomic_set(&vms->hybrid_warm_reset_pending, warm);
-    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
-    return 0;
+    qatomic_set(&vms->hybrid_psci_reset_requested, false);
+    qatomic_set(&vms->hybrid_psci_reset_inflight, true);
+    ret = arm_hybrid_ffa_call(regs);
+    qatomic_set(&vms->hybrid_psci_reset_inflight, false);
+    if (ret || !qatomic_read(&vms->hybrid_psci_reset_requested)) {
+        qatomic_set(&vms->hybrid_warm_reset_pending, false);
+    }
+    return ret ? ret : qatomic_read(&vms->hybrid_psci_reset_requested);
 }
 
 static void virt_hybrid_kvm_handoff_reset(void *opaque)
@@ -3868,7 +3883,7 @@ static void machvirt_init(MachineState *machine)
         create_gpio_devices(vms, VIRT_GPIO, sysmem);
     }
 
-    if (vms->secure && !vmc->no_secure_gpio) {
+    if ((vms->secure || vms->hybrid_secure) && !vmc->no_secure_gpio) {
         create_gpio_devices(vms, VIRT_SECURE_GPIO, secure_sysmem);
     }
 
