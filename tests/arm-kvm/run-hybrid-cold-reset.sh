@@ -139,14 +139,18 @@ direct_count=$(grep -c 'MsgSendDirectReq2' "$normal_log" || true)
 reset_count=$(grep -c \
     '^kvm_arm_psci_system_reset cpu 0 function 0x84000009 warm 0$' \
     "$trace_log" || true)
+tfa_reset_count=$(grep -c 'QEMU System Reset: with GPIO' \
+    "$normal_log" || true)
 expected_resets=$guest_reset
 
-printf 'ready=%d kvm_exit=%d mssp_direct=%d reset=%d\n' \
-    "$ready_count" "$trace_count" "$direct_count" "$reset_count"
+printf 'ready=%d kvm_exit=%d mssp_direct=%d reset=%d tfa_reset=%d\n' \
+    "$ready_count" "$trace_count" "$direct_count" "$reset_count" \
+    "$tfa_reset_count"
 
 if [[ "$qemu_status" -ne 0 || "$ready_count" -ne 2 ||
     "$trace_count" -ne 2 || "$direct_count" -lt 2 ||
-    "$reset_count" -ne "$expected_resets" ]]; then
+    "$reset_count" -ne "$expected_resets" ||
+    "$tfa_reset_count" -ne "$expected_resets" ]]; then
     printf 'qemu_status=%d\n' "$qemu_status"
     cat "$trace_log"
     tail -n 200 "$normal_log"

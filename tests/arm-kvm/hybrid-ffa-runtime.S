@@ -9,6 +9,7 @@
 .equ REBOOT_COUNTER,    0x49000000
 
 .equ PSCI_SYSTEM_OFF,   0x84000008
+.equ PSCI_FEATURES,     0x8400000a
 #ifndef PSCI_RESET_FID
 #define PSCI_RESET_FID 0x84000009
 #endif
@@ -103,6 +104,12 @@ version_succeeded:
 #endif
 
 #ifdef EXPECT_RESET_REJECT
+    ldr x0, =PSCI_FEATURES
+    ldr x1, =PSCI_SYSTEM_RESET
+    smc #0
+    sxtw x20, w0
+    cbnz x20, failed
+
     ldr x0, =PSCI_SYSTEM_RESET
     mov x1, #1
     smc #0
@@ -144,6 +151,12 @@ cold_wait:
 #endif
 
 #ifdef EXPECT_REBOOT
+    ldr x0, =PSCI_FEATURES
+    ldr x1, =PSCI_SYSTEM_RESET
+    smc #0
+    sxtw x20, w0
+    cbnz x20, failed
+
     ldr x0, =REBOOT_COUNTER
     ldr x1, [x0]
     cmp x1, #REBOOT_COUNT

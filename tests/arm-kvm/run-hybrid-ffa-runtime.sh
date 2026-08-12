@@ -10,10 +10,12 @@ trap 'rm -rf "$work_dir"' EXIT
 
 defines=()
 expected_calls=1
+expected_features=0
 expected_resets=0
 if [[ "${EXPECT_RESET_REJECT:-0}" == 1 ]]; then
     reset_fid=${PSCI_RESET_FID:-0x84000012}
     defines+=(-DEXPECT_RESET_REJECT "-DPSCI_RESET_FID=$reset_fid")
+    expected_features=1
 fi
 if [[ "${EXPECT_REBOOT:-0}" == 1 ]]; then
     reboot_count=${REBOOT_COUNT:-4}
@@ -21,6 +23,7 @@ if [[ "${EXPECT_REBOOT:-0}" == 1 ]]; then
     defines+=(-DEXPECT_REBOOT "-DREBOOT_COUNT=$reboot_count"
               "-DPSCI_RESET_FID=$reset_fid")
     expected_calls=$((reboot_count + 1))
+    expected_features=$expected_calls
     expected_resets=$reboot_count
 fi
 
@@ -73,16 +76,24 @@ set -e
 pass_count=$(grep -c '^HYBRID FFA RUNTIME PASS$' "$normal_log" || true)
 trace_count=$(grep -c '^kvm_arm_ffa_stub cpu 0 function 0xc400008d ' "$trace_log" || true)
 direct_count=$(grep -c 'MsgSendDirectReq2' "$normal_log" || true)
+features_count=$(grep -c \
+    '^kvm_arm_psci_features cpu 0 function ' "$trace_log" || true)
 reset_count=$(grep -c \
     '^kvm_arm_psci_system_reset cpu 0 function ' "$trace_log" || true)
+tfa_reset_count=$(grep -c 'QEMU System Reset: with GPIO' \
+    "$normal_log" || true)
 
-printf 'pass=%d kvm_exit=%d mssp_direct=%d reset=%d\n' \
-    "$pass_count" "$trace_count" "$direct_count" "$reset_count"
+printf 'pass=%d kvm_exit=%d mssp_direct=%d features=%d reset=%d '\
+'tfa_reset=%d\n' \
+    "$pass_count" "$trace_count" "$direct_count" "$features_count" \
+    "$reset_count" "$tfa_reset_count"
 
 if [[ "$status" -ne 0 || "$pass_count" -ne 1 ||
     "$trace_count" -ne "$expected_calls" ||
     "$direct_count" -lt "$expected_calls" ||
-    "$reset_count" -ne "$expected_resets" ]]; then
+    "$features_count" -ne "$expected_features" ||
+    "$reset_count" -ne "$expected_resets" ||
+    "$tfa_reset_count" -ne "$expected_resets" ]]; then
     printf 'qemu_status=%d\n' "$status"
     cat "$trace_log"
     tail -n 160 "$normal_log"
