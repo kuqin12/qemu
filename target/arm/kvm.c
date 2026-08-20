@@ -1662,6 +1662,25 @@ static bool kvm_arm_is_ffa_call(uint64_t func_id)
            func_num <= KVM_ARM_FFA_FNUM_MAX;
 }
 
+static void kvm_arm_complete_hybrid_call(CPUState *cs, int ret)
+{
+    if (ret != -ENOTSUP) {
+        /*
+         * Reenter KVM once to complete the hypercall, then exit so pending
+         * interrupts are reevaluated before the guest can block in WFI.
+         */
+        cpu_exit(cs);
+    }
+}
+
+static int kvm_arm_hybrid_ffa_call(CPUState *cs, uint64_t regs[18])
+{
+    int ret = arm_hybrid_ffa_call(regs);
+
+    kvm_arm_complete_hybrid_call(cs, ret);
+    return ret;
+}
+
 static int kvm_arm_handle_smccc_hypercall(CPUState *cs, struct kvm_run *run)
 {
     ARMCPU *cpu = ARM_CPU(cs);
@@ -1701,6 +1720,9 @@ static int kvm_arm_handle_smccc_hypercall(CPUState *cs, struct kvm_run *run)
         ret = arm_hybrid_system_reset(
             regs, func_id != KVM_ARM_PSCI_SYSTEM_RESET &&
                   reset_type == KVM_ARM_PSCI_RESET2_SYSTEM_WARM_RESET);
+        if (ret <= 0) {
+            kvm_arm_complete_hybrid_call(cs, ret);
+        }
         if (ret < 0) {
             env->xregs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
             run->hypercall.ret = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
@@ -1733,7 +1755,7 @@ static int kvm_arm_handle_smccc_hypercall(CPUState *cs, struct kvm_run *run)
         }
 
         memcpy(regs, env->xregs, sizeof(regs));
-        ret = arm_hybrid_ffa_call(regs);
+        ret = kvm_arm_hybrid_ffa_call(cs, regs);
         if (ret) {
             env->xregs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
         } else {
@@ -1758,7 +1780,7 @@ static int kvm_arm_handle_smccc_hypercall(CPUState *cs, struct kvm_run *run)
         trace_kvm_arm_ffa_stub(cs->cpu_index, func_id,
                                env->xregs[1], env->xregs[2]);
         memcpy(regs, env->xregs, sizeof(regs));
-        hybrid_ret = arm_hybrid_ffa_call(regs);
+        hybrid_ret = kvm_arm_hybrid_ffa_call(cs, regs);
         if (!hybrid_ret) {
             memcpy(env->xregs, regs, sizeof(regs));
         } else {
