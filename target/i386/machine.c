@@ -642,6 +642,32 @@ static const VMStateDescription vmstate_msr_smrr = {
     }
 };
 
+static bool smm_intel_state_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+    CPUX86State *env = &cpu->env;
+
+    return IS_INTEL_CPU(env) &&
+           ((env->hflags & HF_SMM_MASK) || env->smm_io_pending);
+}
+
+static const VMStateDescription vmstate_smm_intel = {
+    .name = "cpu/smm_intel",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = smm_intel_state_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_SEGMENT_ARRAY(env.smm_saved_segs, X86CPU, 6),
+        VMSTATE_SEGMENT(env.smm_saved_ldt, X86CPU),
+        VMSTATE_SEGMENT(env.smm_saved_tr, X86CPU),
+        VMSTATE_SEGMENT(env.smm_saved_gdt, X86CPU),
+        VMSTATE_SEGMENT(env.smm_saved_idt, X86CPU),
+        VMSTATE_UINT32(env.smm_io_info, X86CPU),
+        VMSTATE_BOOL(env.smm_io_pending, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static bool tscdeadline_needed(void *opaque)
 {
     X86CPU *cpu = opaque;
@@ -1927,6 +1953,7 @@ const VMStateDescription vmstate_x86_cpu = {
         &vmstate_msr_smi_count,
         &vmstate_msr_smm_monitor_ctl,
         &vmstate_msr_smrr,
+        &vmstate_smm_intel,
         &vmstate_pkru,
         &vmstate_pkrs,
         &vmstate_spec_ctrl,

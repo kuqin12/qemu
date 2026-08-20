@@ -476,6 +476,12 @@ typedef enum X86Seg {
 #define MSR_SMRR_PHYSBASE               0x1f2
 #define MSR_SMRR_PHYSMASK               0x1f3
 
+/* Intel SMRAM save-state IOMisc fields. */
+#define SMM_IO_INFO(port, size, is_input) \
+    (1U | ((size) << 1) | ((is_input) << 4) | ((port) << 16))
+
+QEMU_BUILD_BUG_ON(SMM_IO_INFO(0xb2, 1, 0) != 0x00b20003);
+
 #define MSR_IA32_SYSENTER_CS            0x174
 #define MSR_IA32_SYSENTER_ESP           0x175
 #define MSR_IA32_SYSENTER_EIP           0x176
@@ -2138,6 +2144,17 @@ typedef struct CPUArchState {
     uint64_t msr_smrr_physmask;
     uint64_t msr_smm_feature_control;
 
+    /* Hidden state preserved across SMM when using the Intel save-state map. */
+    SegmentCache smm_saved_segs[6];
+    SegmentCache smm_saved_ldt;
+    SegmentCache smm_saved_tr;
+    SegmentCache smm_saved_gdt;
+    SegmentCache smm_saved_idt;
+
+    /* Intel IOMisc value for a pending synchronous I/O-triggered SMI. */
+    uint32_t smm_io_info;
+    bool smm_io_pending;
+
     uint32_t pkru;
     uint32_t pkrs;
     uint32_t tsx_ctrl;
@@ -2810,6 +2827,8 @@ void cpu_x86_update_dr7(CPUX86State *env, uint32_t new_dr7);
 
 /* hw/pc.c */
 uint64_t cpu_get_tsc(CPUX86State *env);
+void x86_cpu_set_smm_io(CPUState *cs, uint16_t port, unsigned size,
+                        bool is_input);
 
 #define CPU_RESOLVING_TYPE TYPE_X86_CPU
 

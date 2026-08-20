@@ -40,6 +40,7 @@ struct SerialMM {
 
     SerialState serial;
 
+    hwaddr addr;
     uint8_t regshift;
     uint8_t endianness;
 };

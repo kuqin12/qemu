@@ -44,6 +44,25 @@ uint64_t cpu_get_tsc(CPUX86State *env)
     return cpus_get_elapsed_ticks();
 }
 
+void x86_cpu_set_smm_io(CPUState *cs, uint16_t port, unsigned size,
+                        bool is_input)
+{
+    X86CPU *cpu;
+
+    if (!cs) {
+        return;
+    }
+
+    cpu = X86_CPU(cs);
+    if (!IS_INTEL_CPU(&cpu->env)) {
+        return;
+    }
+
+    g_assert(size == 1 || size == 2 || size == 4);
+    cpu->env.smm_io_info = SMM_IO_INFO(port, size, is_input);
+    cpu->env.smm_io_pending = true;
+}
+
 /* IRQ handling */
 static void pic_irq_request(void *opaque, int irq, int level)
 {

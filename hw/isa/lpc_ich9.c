@@ -477,10 +477,12 @@ static void ich9_apm_ctrl_changed(uint32_t val, void *arg)
         if (lpc->smi_negotiated_features &
             (UINT64_C(1) << ICH9_LPC_SMI_F_BROADCAST_BIT)) {
             CPUState *cs;
+            x86_cpu_set_smm_io(current_cpu, APM_CNT_IOPORT, 1, false);
             CPU_FOREACH(cs) {
                 cpu_interrupt(cs, CPU_INTERRUPT_SMI);
             }
         } else {
+            x86_cpu_set_smm_io(current_cpu, APM_CNT_IOPORT, 1, false);
             cpu_interrupt(current_cpu, CPU_INTERRUPT_SMI);
         }
     }
