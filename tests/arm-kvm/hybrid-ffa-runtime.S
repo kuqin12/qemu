@@ -5,8 +5,24 @@
 .equ UARTDR,            0x000
 .equ UARTFR,            0x018
 
+.equ GICD_BASE,          0x08000000
+.equ GICD_CTLR,          0x0000
+.equ GICD_ENABLE_GRP1NS, (1 << 1)
+.equ GICD_RWP,           (1 << 31)
+.equ GICR_BASE,          0x080a0000
+.equ GICR_WAKER,         0x0014
+.equ GICR_IGROUPR0,      0x10080
+.equ GICR_ISENABLER0,    0x10100
+.equ GICR_IPRIORITYR,    0x10400
+.equ GICR_PROCESSOR_SLEEP, (1 << 1)
+.equ GICR_CHILDREN_ASLEEP, (1 << 2)
+
+.equ VIRTUAL_TIMER_IRQ,  27
+.equ VIRTUAL_TIMER_BIT,  (1 << VIRTUAL_TIMER_IRQ)
+
 .equ STACK_TOP,         0x48000000
 .equ REBOOT_COUNTER,    0x49000000
+.equ TIMER_SEEN,         0x49000008
 
 .equ PSCI_SYSTEM_OFF,   0x84000008
 .equ PSCI_FEATURES,     0x8400000a
@@ -51,6 +67,8 @@ version_succeeded:
     cmp x0, x1
     b.lo failed
 
+    bl setup_timer_irq
+
     ldr x0, =FFA_DIRECT_REQ2
     ldr x1, =FFA_ENDPOINTS_REQ
     ldr x2, =0xaf4f0618a462b817
@@ -76,6 +94,15 @@ version_succeeded:
     mov x24, x2
     mov x22, x4
     mov x23, x5
+
+timer_wait:
+    ldr x0, =TIMER_SEEN
+    ldar x0, [x0]
+    cbnz x0, timer_received
+    wfi
+    b timer_wait
+timer_received:
+    msr daifset, #2
 
 #ifdef EXPECT_TIMEOUT
     ldr x0, =FFA_ERROR
@@ -176,6 +203,7 @@ passed:
     b power_off
 
 failed:
+    msr daifset, #2
     ldr x0, =fail
     bl puts
     mov x0, x20
@@ -199,6 +227,114 @@ power_off:
     ldr x0, =PSCI_SYSTEM_OFF
     hvc #0
     b .
+
+setup_timer_irq:
+    ldr x0, =TIMER_SEEN
+    str xzr, [x0]
+
+    ldr x0, =vector_table
+    msr vbar_el1, x0
+    isb
+
+    ldr x0, =GICD_BASE
+    ldr w1, [x0, #GICD_CTLR]
+    orr w1, w1, #GICD_ENABLE_GRP1NS
+    str w1, [x0, #GICD_CTLR]
+    dsb sy
+gic_dist_wait:
+    ldr w1, [x0, #GICD_CTLR]
+    tbnz w1, #31, gic_dist_wait
+
+    ldr x0, =GICR_BASE
+    ldr w1, [x0, #GICR_WAKER]
+    bic w1, w1, #GICR_PROCESSOR_SLEEP
+    str w1, [x0, #GICR_WAKER]
+gic_redist_wait:
+    ldr w1, [x0, #GICR_WAKER]
+    tbnz w1, #2, gic_redist_wait
+
+    mov w1, #VIRTUAL_TIMER_BIT
+    ldr x2, =GICR_IGROUPR0
+    str w1, [x0, x2]
+    ldr x2, =GICR_ISENABLER0
+    str w1, [x0, x2]
+    ldr x2, =GICR_IPRIORITYR
+    add x0, x0, x2
+    mov w1, #0x80
+    strb w1, [x0, #VIRTUAL_TIMER_IRQ]
+    dsb sy
+
+    mov x0, #1
+    msr S3_0_C12_C12_5, x0
+    isb
+    mov x0, #0xff
+    msr S3_0_C4_C6_0, x0
+    mov x0, #1
+    msr S3_0_C12_C12_7, x0
+
+    mrs x0, cntfrq_el0
+    mov x1, #100
+    udiv x0, x0, x1
+    mrs x1, cntvct_el0
+    add x0, x0, x1
+    msr cntv_cval_el0, x0
+    mov x0, #1
+    msr cntv_ctl_el0, x0
+    isb
+    msr daifclr, #2
+    ret
+
+.balign 2048
+vector_table:
+.macro vector target
+    b \target
+    .space 124
+.endm
+    vector unexpected
+    vector irq_handler
+    vector unexpected
+    vector unexpected
+    vector unexpected
+    vector irq_handler
+    vector unexpected
+    vector unexpected
+    vector unexpected
+    vector irq_handler
+    vector unexpected
+    vector unexpected
+    vector unexpected
+    vector irq_handler
+    vector unexpected
+    vector unexpected
+
+irq_handler:
+    sub sp, sp, #32
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+
+    mrs x0, S3_0_C12_C12_0
+    and w1, w0, #0x3ff
+    cmp w1, #1020
+    b.hs irq_restore
+    cmp w1, #VIRTUAL_TIMER_IRQ
+    b.ne irq_eoi
+
+    msr cntv_ctl_el0, xzr
+    ldr x2, =TIMER_SEEN
+    mov x3, #1
+    stlr x3, [x2]
+irq_eoi:
+    msr S3_0_C12_C12_1, x0
+    isb
+irq_restore:
+    ldp x2, x3, [sp, #16]
+    ldp x0, x1, [sp, #0]
+    add sp, sp, #32
+    eret
+
+unexpected:
+    msr daifset, #0xf
+    b failed
 
 puts:
     mov x9, x30

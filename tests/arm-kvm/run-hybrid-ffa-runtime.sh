@@ -58,7 +58,7 @@ timeout --kill-after=5s 30s "$qemu" \
     -cpu host \
     -smp 2 \
     -m 2048M \
-    -accel kvm,arm-ffa-forward=on \
+    -accel kvm,arm-ffa-forward=on,arm-ffa-stub-delay-ms=100 \
     -global driver=cfi.pflash01,property=secure,value=on \
     -drive "if=pflash,format=raw,unit=0,file=$secure_flash,readonly=on" \
     -drive "if=pflash,format=raw,unit=1,file=$work_dir/normal-flash.fd,readonly=on" \
