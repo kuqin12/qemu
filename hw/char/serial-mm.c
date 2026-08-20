@@ -71,6 +71,7 @@ static const MemoryRegionOps serial_mm_ops[] = {
 static void serial_mm_realize(DeviceState *dev, Error **errp)
 {
     SerialMM *smm = SERIAL_MM(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     SerialState *s = &smm->serial;
 
     if (!qdev_realize(DEVICE(s), NULL, errp)) {
@@ -80,8 +81,11 @@ static void serial_mm_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->io, OBJECT(dev),
                           &serial_mm_ops[smm->endianness], smm, "serial",
                           8 << smm->regshift);
-    sysbus_init_mmio(SYS_BUS_DEVICE(smm), &s->io);
-    sysbus_init_irq(SYS_BUS_DEVICE(smm), &smm->serial.irq);
+    sysbus_init_mmio(sbd, &s->io);
+    sysbus_init_irq(sbd, &smm->serial.irq);
+    if (smm->addr != (hwaddr)-1) {
+        sysbus_mmio_map(sbd, 0, smm->addr);
+    }
 }
 
 static const VMStateDescription vmstate_serial_mm = {
@@ -126,6 +130,7 @@ static void serial_mm_instance_init(Object *o)
 }
 
 static const Property serial_mm_properties[] = {
+    DEFINE_PROP_UINT64("addr", SerialMM, addr, -1),
     /*
      * Set the spacing between adjacent memory-mapped UART registers.
      * Each register will be at (1 << regshift) bytes after the previous one.
@@ -146,7 +151,7 @@ static void serial_mm_class_init(ObjectClass *oc, const void *data)
 static const TypeInfo types[] = {
     {
         .name = TYPE_SERIAL_MM,
-        .parent = TYPE_SYS_BUS_DEVICE,
+        .parent = TYPE_DYNAMIC_SYS_BUS_DEVICE,
         .class_init = serial_mm_class_init,
         .instance_init = serial_mm_instance_init,
         .instance_size = sizeof(SerialMM),

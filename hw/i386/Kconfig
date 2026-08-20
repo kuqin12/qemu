@@ -102,6 +102,7 @@ config Q35
     bool
     default y
     depends on I386
+    select SERIAL_MM
     imply VTD
     imply AMD_IOMMU
     imply E1000E_PCI_EXPRESS
