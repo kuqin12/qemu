@@ -17,6 +17,9 @@
 #include "qobject/qdict.h"
 
 #define TSEG_SIZE_TEST_GUEST_RAM_MBYTES 128
+#define Q35_MMIO_UART_BASE 0xfe02e000
+#define UART_LSR_OFFSET 5
+#define UART_LSR_THRE 0x20
 
 /* @esmramc_tseg_sz: ESMRAMC.TSEG_SZ bitmask for selecting the requested TSEG
  *                   size. Must be a subset of
@@ -240,6 +243,21 @@ static void test_smram_smbase_lock(void)
     qtest_quit(qts);
 }
 
+static void test_mmio_uart(void)
+{
+    QTestState *qts;
+
+    qts = qtest_init("-M q35 -chardev null,id=uart0 "
+                     "-device serial-mm,addr=0xfe02e000,regshift=0,"
+                     "chardev=uart0");
+
+    g_assert_cmphex(qtest_readb(qts, Q35_MMIO_UART_BASE + UART_LSR_OFFSET) &
+                    UART_LSR_THRE, ==, UART_LSR_THRE);
+    qtest_writeb(qts, Q35_MMIO_UART_BASE, 'A');
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -252,6 +270,7 @@ int main(int argc, char **argv)
     qtest_add_data_func("/q35/tseg-size/ext/16mb", &tseg_ext_16mb,
                         test_tseg_size);
     qtest_add_func("/q35/smram/smbase_lock", test_smram_smbase_lock);
+    qtest_add_func("/q35/mmio-uart", test_mmio_uart);
 
     return g_test_run();
 }
