@@ -577,6 +577,11 @@ void kvm_arm_add_vcpu_properties(ARMCPU *cpu)
                                         "Set on to disable the adjustment of "
                                         "the virtual counter. VM stopped time "
                                         "will be counted.");
+        object_property_add_uint64_ptr(obj, "kvm-virtual-time",
+                                       &cpu->kvm_vtime,
+                                       OBJ_PROP_FLAG_READ);
+        object_property_set_description(obj, "kvm-virtual-time",
+                                        "Saved KVM virtual counter value");
     }
 
     cpu->kvm_steal_time = ON_OFF_AUTO_AUTO;
@@ -1664,12 +1669,21 @@ static bool kvm_arm_is_ffa_call(uint64_t func_id)
 
 static void kvm_arm_complete_hybrid_call(CPUState *cs, int ret)
 {
+    CPUState *peer;
+
     if (ret != -ENOTSUP) {
         /*
          * Reenter KVM once to complete the hypercall, then exit so pending
          * interrupts are reevaluated before the guest can block in WFI.
          */
         cpu_exit(cs);
+
+        /* Peers may be waiting for IPIs or timers raised during the call. */
+        CPU_FOREACH(peer) {
+            if (peer != cs && !peer->secondary_tcg) {
+                qemu_cpu_kick(peer);
+            }
+        }
     }
 }
 
