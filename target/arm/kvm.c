@@ -1669,21 +1669,12 @@ static bool kvm_arm_is_ffa_call(uint64_t func_id)
 
 static void kvm_arm_complete_hybrid_call(CPUState *cs, int ret)
 {
-    CPUState *peer;
-
     if (ret != -ENOTSUP) {
         /*
          * Reenter KVM once to complete the hypercall, then exit so pending
          * interrupts are reevaluated before the guest can block in WFI.
          */
         cpu_exit(cs);
-
-        /* Peers may be waiting for IPIs or timers raised during the call. */
-        CPU_FOREACH(peer) {
-            if (peer != cs && !peer->secondary_tcg) {
-                qemu_cpu_kick(peer);
-            }
-        }
     }
 }
 
