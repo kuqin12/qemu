@@ -23,12 +23,14 @@
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "hw/intc/arm_gicv3_its_common.h"
+#include "hw/core/cpu.h"
 #include "hw/core/qdev-properties.h"
 #include "system/runstate.h"
 #include "system/kvm.h"
 #include "kvm_arm.h"
 #include "migration/blocker.h"
 #include "qom/object.h"
+#include "trace.h"
 
 #define TYPE_KVM_ARM_ITS "arm-its-kvm"
 typedef struct KVMARMITSClass KVMARMITSClass;
@@ -45,6 +47,9 @@ struct KVMARMITSClass {
 static int kvm_its_send_msi(GICv3ITSState *s, uint32_t value, uint16_t devid)
 {
     struct kvm_msi msi;
+    CPUState *cs;
+    bool kick;
+    int ret;
 
     if (unlikely(!s->translater_gpa_known)) {
         MemoryRegion *mr = &s->iomem_its_translation;
@@ -63,7 +68,18 @@ static int kvm_its_send_msi(GICv3ITSState *s, uint32_t value, uint16_t devid)
     msi.devid = devid;
     memset(msi.pad, 0, sizeof(msi.pad));
 
-    return kvm_vm_ioctl(kvm_state, KVM_SIGNAL_MSI, &msi);
+    ret = kvm_vm_ioctl(kvm_state, KVM_SIGNAL_MSI, &msi);
+    kick = !ret && kvm_arm_ffa_forward_enabled();
+    trace_kvm_its_send_msi(devid, value, ret, kick);
+    if (kick) {
+        CPU_FOREACH(cs) {
+            if (!cs->secondary_tcg) {
+                qemu_cpu_kick(cs);
+            }
+        }
+    }
+
+    return ret;
 }
 
 /**

@@ -2054,6 +2054,11 @@ static bool kvm_arm_get_ffa_forward(Object *obj, Error **errp)
     return s->arm_ffa_forward;
 }
 
+bool kvm_arm_ffa_forward_enabled(void)
+{
+    return kvm_state->arm_ffa_forward;
+}
+
 static void kvm_arm_set_ffa_forward(Object *obj, bool value, Error **errp)
 {
     KVMState *s = KVM_STATE(obj);
