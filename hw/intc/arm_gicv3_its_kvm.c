@@ -22,6 +22,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include "hw/intc/arm_gicv3_its_common.h"
 #include "hw/core/cpu.h"
 #include "hw/core/qdev-properties.h"
@@ -33,19 +34,62 @@
 #include "trace.h"
 
 #define TYPE_KVM_ARM_ITS "arm-its-kvm"
+typedef struct KVMARMITSState KVMARMITSState;
 typedef struct KVMARMITSClass KVMARMITSClass;
-/* This is reusing the GICv3ITSState typedef from ARM_GICV3_ITS_COMMON */
-DECLARE_OBJ_CHECKERS(GICv3ITSState, KVMARMITSClass,
+DECLARE_OBJ_CHECKERS(KVMARMITSState, KVMARMITSClass,
                      KVM_ARM_ITS, TYPE_KVM_ARM_ITS)
+
+struct KVMARMITSState {
+    GICv3ITSState parent_obj;
+    QEMUTimer wake_timer;
+    unsigned int wake_retry;
+};
 
 struct KVMARMITSClass {
     GICv3ITSCommonClass parent_class;
     ResettablePhases parent_phases;
 };
 
+static const unsigned int kvm_its_wake_retry_ms[] = {
+    10, 100, 1000,
+};
+
+static void kvm_its_wake_cpu(CPUState *cs, run_on_cpu_data data)
+{
+}
+
+static void kvm_its_queue_cpu_wake(void)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        if (!cs->secondary_tcg) {
+            async_run_on_cpu(cs, kvm_its_wake_cpu, RUN_ON_CPU_NULL);
+        }
+    }
+}
+
+static void kvm_its_wake_timer(void *opaque)
+{
+    KVMARMITSState *its = opaque;
+    unsigned int retry = its->wake_retry++;
+
+    g_assert(retry < ARRAY_SIZE(kvm_its_wake_retry_ms));
+    trace_kvm_its_wake_retry(retry + 1,
+                             kvm_its_wake_retry_ms[retry]);
+    kvm_its_queue_cpu_wake();
+
+    if (its->wake_retry < ARRAY_SIZE(kvm_its_wake_retry_ms)) {
+        timer_mod(&its->wake_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  kvm_its_wake_retry_ms[its->wake_retry] -
+                  kvm_its_wake_retry_ms[retry]);
+    }
+}
 
 static int kvm_its_send_msi(GICv3ITSState *s, uint32_t value, uint16_t devid)
 {
+    KVMARMITSState *its = KVM_ARM_ITS(s);
     struct kvm_msi msi;
     CPUState *cs;
     bool kick;
@@ -77,6 +121,17 @@ static int kvm_its_send_msi(GICv3ITSState *s, uint32_t value, uint16_t devid)
                 qemu_cpu_kick(cs);
             }
         }
+
+        /*
+         * The immediate kick may be consumed while the guest masks IRQs,
+         * before it later enters WFI with the LPI still pending. Coalesce a
+         * bounded set of queued vCPU work items after the MSI burst; unlike a
+         * bare kick, queued work guarantees another KVM_RUN re-entry.
+         */
+        its->wake_retry = 0;
+        timer_mod(&its->wake_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  kvm_its_wake_retry_ms[0]);
     }
 
     return ret;
@@ -216,8 +271,12 @@ static void kvm_arm_its_post_load(GICv3ITSState *s)
 static void kvm_arm_its_reset_hold(Object *obj, ResetType type)
 {
     GICv3ITSState *s = ARM_GICV3_ITS_COMMON(obj);
+    KVMARMITSState *its = KVM_ARM_ITS(obj);
     KVMARMITSClass *c = KVM_ARM_ITS_GET_CLASS(s);
     int i;
+
+    timer_del(&its->wake_timer);
+    its->wake_retry = 0;
 
     if (c->parent_phases.hold) {
         c->parent_phases.hold(obj, type);
@@ -255,6 +314,21 @@ static const Property kvm_arm_its_props[] = {
                      GICv3State *),
 };
 
+static void kvm_arm_its_instance_init(Object *obj)
+{
+    KVMARMITSState *its = KVM_ARM_ITS(obj);
+
+    timer_init_ms(&its->wake_timer, QEMU_CLOCK_VIRTUAL,
+                  kvm_its_wake_timer, its);
+}
+
+static void kvm_arm_its_instance_finalize(Object *obj)
+{
+    KVMARMITSState *its = KVM_ARM_ITS(obj);
+
+    timer_del(&its->wake_timer);
+}
+
 static void kvm_arm_its_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -274,7 +348,9 @@ static void kvm_arm_its_class_init(ObjectClass *klass, const void *data)
 static const TypeInfo kvm_arm_its_info = {
     .name = TYPE_KVM_ARM_ITS,
     .parent = TYPE_ARM_GICV3_ITS_COMMON,
-    .instance_size = sizeof(GICv3ITSState),
+    .instance_size = sizeof(KVMARMITSState),
+    .instance_init = kvm_arm_its_instance_init,
+    .instance_finalize = kvm_arm_its_instance_finalize,
     .class_init = kvm_arm_its_class_init,
     .class_size = sizeof(KVMARMITSClass),
 };

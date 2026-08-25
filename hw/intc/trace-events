@@ -189,6 +189,7 @@ gicv3_redist_send_sgi(uint32_t cpu, int irq) "GICv3 redistributor 0x%x pending S
 
 # arm_gicv3_its.c
 kvm_its_send_msi(uint16_t devid, uint32_t eventid, int ret, bool kick) "DeviceID 0x%x EventID 0x%x ret %d kick %d"
+kvm_its_wake_retry(uint32_t retry, uint32_t delay_ms) "retry %u delay %u ms"
 gicv3_its_read(uint64_t offset, uint64_t data, unsigned size) "GICv3 ITS read: offset 0x%" PRIx64 " data 0x%" PRIx64 " size %u"
 gicv3_its_badread(uint64_t offset, unsigned size) "GICv3 ITS read: offset 0x%" PRIx64 " size %u: error"
 gicv3_its_write(uint64_t offset, uint64_t data, unsigned size) "GICv3 ITS write: offset 0x%" PRIx64 " data 0x%" PRIx64 " size %u"
