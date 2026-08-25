@@ -51,7 +51,7 @@ struct KVMARMITSClass {
 };
 
 static const unsigned int kvm_its_wake_retry_ms[] = {
-    10, 100, 1000,
+    10, 100, 1000, 2000, 4000, 8000,
 };
 
 static void kvm_its_wake_cpu(CPUState *cs, run_on_cpu_data data)
