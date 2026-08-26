@@ -58,6 +58,8 @@ static const unsigned int kvm_its_wake_retry_ms[] = {
     10, 100, 1000, 2000, 4000, 8000,
 };
 
+#define KVM_ITS_RESTORE_RETRY 2
+
 static void kvm_its_wake_cpu(CPUState *cs, run_on_cpu_data data)
 {
 }
@@ -116,24 +118,114 @@ static void kvm_its_queue_blocked_msi(KVMARMITSState *its,
               kvm_its_wake_retry_ms[0]);
 }
 
+static int kvm_its_snapshot_regs(GICv3ITSState *s, Error **errp)
+{
+    int i;
+    int ret;
+
+    for (i = 0; i < 8; i++) {
+        ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                                GITS_BASER + i * 8, &s->baser[i], false,
+                                errp);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_CTLR, &s->ctlr, false, errp);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_CBASER, &s->cbaser, false, errp);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_CREADR, &s->creadr, false, errp);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_CWRITER, &s->cwriter, false, errp);
+    if (ret < 0) {
+        return ret;
+    }
+    return kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                             GITS_IIDR, &s->iidr, false, errp);
+}
+
+static int kvm_its_rebuild_tables(GICv3ITSState *s, Error **errp)
+{
+    int i;
+    int ret;
+
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
+                            KVM_DEV_ARM_ITS_CTRL_RESET, NULL, true, errp);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_IIDR, &s->iidr, true, errp);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_CBASER, &s->cbaser, true, errp);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_CREADR, &s->creadr, true, errp);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_CWRITER, &s->cwriter, true, errp);
+    if (ret < 0) {
+        return ret;
+    }
+
+    for (i = 0; i < 8; i++) {
+        ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                                GITS_BASER + i * 8, &s->baser[i], true,
+                                errp);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
+                            KVM_DEV_ARM_ITS_RESTORE_TABLES, NULL, true, errp);
+    if (ret < 0) {
+        return ret;
+    }
+    return kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                             GITS_CTLR, &s->ctlr, true, errp);
+}
+
 static void kvm_its_restore_retained_tables(KVMARMITSState *its)
 {
     GICv3ITSState *s = &its->parent_obj;
     Error *err = NULL;
     bool was_running = runstate_is_running();
+    int ret;
 
     its->restore_attempted = true;
     if (was_running) {
-        pause_all_vcpus();
+        pause_all_vcpus_excluding_secondary_tcg();
     }
 
-    kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
-                      KVM_DEV_ARM_ITS_RESTORE_TABLES,
-                      NULL, true, &err);
+    ret = kvm_its_snapshot_regs(s, &err);
+    if (ret >= 0) {
+        ret = kvm_its_rebuild_tables(s, &err);
+    }
 
     if (was_running) {
-        resume_all_vcpus();
+        resume_all_vcpus_excluding_secondary_tcg();
     }
+    trace_kvm_its_restore_tables(ret);
     if (err) {
         error_report_err(err);
     }
@@ -147,7 +239,8 @@ static void kvm_its_wake_timer(void *opaque)
     bool delivered = false;
 
     g_assert(retry < ARRAY_SIZE(kvm_its_wake_retry_ms));
-    if (!its->state_valid && !its->restore_attempted) {
+    if (!its->state_valid && !its->restore_attempted &&
+        retry == KVM_ITS_RESTORE_RETRY) {
         kvm_its_restore_retained_tables(its);
     }
 

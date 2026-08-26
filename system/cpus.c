@@ -626,12 +626,12 @@ void cpu_resume(CPUState *cpu)
     qemu_cpu_kick(cpu);
 }
 
-static bool all_vcpus_paused(void)
+static bool all_vcpus_paused(bool include_secondary_tcg)
 {
     CPUState *cpu;
 
     CPU_FOREACH(cpu) {
-        if (!cpu->stopped) {
+        if ((include_secondary_tcg || !cpu->secondary_tcg) && !cpu->stopped) {
             return false;
         }
     }
@@ -639,13 +639,15 @@ static bool all_vcpus_paused(void)
     return true;
 }
 
-void pause_all_vcpus(void)
+static void do_pause_all_vcpus(bool include_secondary_tcg)
 {
     CPUState *cpu;
 
     qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false);
     CPU_FOREACH(cpu) {
-        cpu_pause(cpu);
+        if (include_secondary_tcg || !cpu->secondary_tcg) {
+            cpu_pause(cpu);
+        }
     }
 
     /* We need to drop the replay_lock so any vCPU threads woken up
@@ -653,11 +655,13 @@ void pause_all_vcpus(void)
      */
     replay_mutex_unlock();
 
-    while (!all_vcpus_paused()) {
+    while (!all_vcpus_paused(include_secondary_tcg)) {
         qemu_cond_wait(&qemu_pause_cond, &bql);
         /* FIXME: is this needed? */
         CPU_FOREACH(cpu) {
-            qemu_cpu_kick(cpu);
+            if (include_secondary_tcg || !cpu->secondary_tcg) {
+                qemu_cpu_kick(cpu);
+            }
         }
     }
 
@@ -666,7 +670,17 @@ void pause_all_vcpus(void)
     bql_lock();
 }
 
-void resume_all_vcpus(void)
+void pause_all_vcpus(void)
+{
+    do_pause_all_vcpus(true);
+}
+
+void pause_all_vcpus_excluding_secondary_tcg(void)
+{
+    do_pause_all_vcpus(false);
+}
+
+static void do_resume_all_vcpus(bool include_secondary_tcg)
 {
     CPUState *cpu;
 
@@ -676,8 +690,20 @@ void resume_all_vcpus(void)
 
     qemu_clock_enable(QEMU_CLOCK_VIRTUAL, true);
     CPU_FOREACH(cpu) {
-        cpu_resume(cpu);
+        if (include_secondary_tcg || !cpu->secondary_tcg) {
+            cpu_resume(cpu);
+        }
     }
+}
+
+void resume_all_vcpus(void)
+{
+    do_resume_all_vcpus(true);
+}
+
+void resume_all_vcpus_excluding_secondary_tcg(void)
+{
+    do_resume_all_vcpus(false);
 }
 
 void cpu_remove_sync(CPUState *cpu)
