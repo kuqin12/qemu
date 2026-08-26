@@ -113,7 +113,8 @@ static int kvm_its_send_msi(GICv3ITSState *s, uint32_t value, uint16_t devid)
     memset(msi.pad, 0, sizeof(msi.pad));
 
     ret = kvm_vm_ioctl(kvm_state, KVM_SIGNAL_MSI, &msi);
-    kick = !ret && kvm_arm_ffa_forward_enabled();
+    /* KVM_SIGNAL_MSI returns > 0 when the MSI was delivered. */
+    kick = ret > 0 && kvm_arm_ffa_forward_enabled();
     trace_kvm_its_send_msi(devid, value, ret, kick);
     if (kick) {
         CPU_FOREACH(cs) {
