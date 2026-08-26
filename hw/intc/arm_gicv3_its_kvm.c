@@ -26,7 +26,6 @@
 #include "hw/intc/arm_gicv3_its_common.h"
 #include "hw/core/cpu.h"
 #include "hw/core/qdev-properties.h"
-#include "system/cpus.h"
 #include "system/runstate.h"
 #include "system/kvm.h"
 #include "kvm_arm.h"
@@ -45,8 +44,6 @@ struct KVMARMITSState {
     QEMUTimer wake_timer;
     GQueue blocked_msis;
     unsigned int wake_retry;
-    bool state_valid;
-    bool restore_attempted;
 };
 
 struct KVMARMITSClass {
@@ -57,8 +54,6 @@ struct KVMARMITSClass {
 static const unsigned int kvm_its_wake_retry_ms[] = {
     10, 100, 1000, 2000, 4000, 8000,
 };
-
-#define KVM_ITS_RESTORE_RETRY 2
 
 static void kvm_its_wake_cpu(CPUState *cs, run_on_cpu_data data)
 {
@@ -118,119 +113,6 @@ static void kvm_its_queue_blocked_msi(KVMARMITSState *its,
               kvm_its_wake_retry_ms[0]);
 }
 
-static int kvm_its_snapshot_regs(GICv3ITSState *s, Error **errp)
-{
-    int i;
-    int ret;
-
-    for (i = 0; i < 8; i++) {
-        ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                                GITS_BASER + i * 8, &s->baser[i], false,
-                                errp);
-        if (ret < 0) {
-            return ret;
-        }
-    }
-
-    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                            GITS_CTLR, &s->ctlr, false, errp);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                            GITS_CBASER, &s->cbaser, false, errp);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                            GITS_CREADR, &s->creadr, false, errp);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                            GITS_CWRITER, &s->cwriter, false, errp);
-    if (ret < 0) {
-        return ret;
-    }
-    return kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                             GITS_IIDR, &s->iidr, false, errp);
-}
-
-static int kvm_its_rebuild_tables(GICv3ITSState *s, Error **errp)
-{
-    int i;
-    int ret;
-
-    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
-                            KVM_DEV_ARM_ITS_CTRL_RESET, NULL, true, errp);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                            GITS_IIDR, &s->iidr, true, errp);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                            GITS_CBASER, &s->cbaser, true, errp);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                            GITS_CREADR, &s->creadr, true, errp);
-    if (ret < 0) {
-        return ret;
-    }
-    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                            GITS_CWRITER, &s->cwriter, true, errp);
-    if (ret < 0) {
-        return ret;
-    }
-
-    for (i = 0; i < 8; i++) {
-        ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                                GITS_BASER + i * 8, &s->baser[i], true,
-                                errp);
-        if (ret < 0) {
-            return ret;
-        }
-    }
-
-    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
-                            KVM_DEV_ARM_ITS_RESTORE_TABLES, NULL, true, errp);
-    if (ret < 0) {
-        return ret;
-    }
-    return kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                             GITS_CTLR, &s->ctlr, true, errp);
-}
-
-static void kvm_its_restore_retained_tables(KVMARMITSState *its)
-{
-    GICv3ITSState *s = &its->parent_obj;
-    Error *err = NULL;
-    bool was_running = runstate_is_running();
-    int ret;
-
-    its->restore_attempted = true;
-    if (was_running) {
-        pause_all_vcpus_excluding_secondary_tcg();
-    }
-
-    ret = kvm_its_snapshot_regs(s, &err);
-    if (ret >= 0) {
-        ret = kvm_its_rebuild_tables(s, &err);
-    }
-
-    if (was_running) {
-        resume_all_vcpus_excluding_secondary_tcg();
-    }
-    trace_kvm_its_restore_tables(ret);
-    if (err) {
-        error_report_err(err);
-    }
-}
-
 static void kvm_its_wake_timer(void *opaque)
 {
     KVMARMITSState *its = opaque;
@@ -239,18 +121,12 @@ static void kvm_its_wake_timer(void *opaque)
     bool delivered = false;
 
     g_assert(retry < ARRAY_SIZE(kvm_its_wake_retry_ms));
-    if (!its->state_valid && !its->restore_attempted &&
-        retry == KVM_ITS_RESTORE_RETRY) {
-        kvm_its_restore_retained_tables(its);
-    }
-
     while (item) {
         struct kvm_msi *blocked = item->data;
         GList *next = item->next;
         int ret;
 
         ret = kvm_vm_ioctl(kvm_state, KVM_SIGNAL_MSI, blocked);
-        its->state_valid |= ret > 0;
         trace_kvm_its_wake_retry(blocked->devid, blocked->data,
                                  ret, retry + 1,
                                  kvm_its_wake_retry_ms[retry]);
@@ -305,7 +181,6 @@ static int kvm_its_send_msi(GICv3ITSState *s, uint32_t value, uint16_t devid)
 
     ret = kvm_vm_ioctl(kvm_state, KVM_SIGNAL_MSI, &msi);
     /* KVM_SIGNAL_MSI returns > 0 when the MSI was delivered. */
-    its->state_valid |= ret > 0;
     kick = ret > 0 && kvm_arm_ffa_forward_enabled();
     trace_kvm_its_send_msi(devid, value, ret, kick);
     if (ret == 0 && kvm_arm_ffa_forward_enabled()) {
@@ -332,15 +207,10 @@ static int kvm_its_send_msi(GICv3ITSState *s, uint32_t value, uint16_t devid)
 static void vm_change_state_handler(void *opaque, bool running,
                                     RunState state)
 {
-    KVMARMITSState *its = KVM_ARM_ITS(opaque);
-    GICv3ITSState *s = &its->parent_obj;
+    GICv3ITSState *s = (GICv3ITSState *)opaque;
     Error *err = NULL;
 
     if (running) {
-        return;
-    }
-    if (kvm_arm_ffa_forward_enabled() && !its->state_valid &&
-        (state == RUN_STATE_DEBUG || state == RUN_STATE_PAUSED)) {
         return;
     }
 
@@ -467,8 +337,6 @@ static void kvm_arm_its_reset_hold(Object *obj, ResetType type)
     int i;
 
     kvm_its_clear_blocked_msis(its);
-    its->state_valid = false;
-    its->restore_attempted = false;
 
     if (c->parent_phases.hold) {
         c->parent_phases.hold(obj, type);
