@@ -42,6 +42,7 @@ DECLARE_OBJ_CHECKERS(KVMARMITSState, KVMARMITSClass,
 struct KVMARMITSState {
     GICv3ITSState parent_obj;
     QEMUTimer wake_timer;
+    GQueue blocked_msis;
     unsigned int wake_retry;
 };
 
@@ -69,21 +70,87 @@ static void kvm_its_queue_cpu_wake(void)
     }
 }
 
+static bool kvm_its_same_msi(const struct kvm_msi *a,
+                             const struct kvm_msi *b)
+{
+    return a->address_lo == b->address_lo &&
+           a->address_hi == b->address_hi &&
+           a->data == b->data &&
+           a->flags == b->flags &&
+           a->devid == b->devid;
+}
+
+static void kvm_its_clear_blocked_msis(KVMARMITSState *its)
+{
+    timer_del(&its->wake_timer);
+    its->wake_retry = 0;
+
+    while (!g_queue_is_empty(&its->blocked_msis)) {
+        g_free(g_queue_pop_head(&its->blocked_msis));
+    }
+}
+
+static void kvm_its_queue_blocked_msi(KVMARMITSState *its,
+                                      const struct kvm_msi *msi)
+{
+    struct kvm_msi *blocked;
+    GList *item;
+
+    for (item = its->blocked_msis.head; item; item = item->next) {
+        blocked = item->data;
+        if (kvm_its_same_msi(blocked, msi)) {
+            return;
+        }
+    }
+
+    blocked = g_new(struct kvm_msi, 1);
+    *blocked = *msi;
+    g_queue_push_tail(&its->blocked_msis, blocked);
+
+    its->wake_retry = 0;
+    timer_mod(&its->wake_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+              kvm_its_wake_retry_ms[0]);
+}
+
 static void kvm_its_wake_timer(void *opaque)
 {
     KVMARMITSState *its = opaque;
+    GList *item = its->blocked_msis.head;
     unsigned int retry = its->wake_retry++;
+    bool delivered = false;
 
     g_assert(retry < ARRAY_SIZE(kvm_its_wake_retry_ms));
-    trace_kvm_its_wake_retry(retry + 1,
-                             kvm_its_wake_retry_ms[retry]);
-    kvm_its_queue_cpu_wake();
+    while (item) {
+        struct kvm_msi *blocked = item->data;
+        GList *next = item->next;
+        int ret;
 
-    if (its->wake_retry < ARRAY_SIZE(kvm_its_wake_retry_ms)) {
+        ret = kvm_vm_ioctl(kvm_state, KVM_SIGNAL_MSI, blocked);
+        trace_kvm_its_wake_retry(blocked->devid, blocked->data,
+                                 ret, retry + 1,
+                                 kvm_its_wake_retry_ms[retry]);
+        if (ret != 0) {
+            g_queue_delete_link(&its->blocked_msis, item);
+            g_free(blocked);
+            delivered |= ret > 0;
+        }
+        item = next;
+    }
+
+    if (delivered) {
+        kvm_its_queue_cpu_wake();
+    }
+
+    if (g_queue_is_empty(&its->blocked_msis)) {
+        its->wake_retry = 0;
+    } else if (its->wake_retry < ARRAY_SIZE(kvm_its_wake_retry_ms)) {
         timer_mod(&its->wake_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
                   kvm_its_wake_retry_ms[its->wake_retry] -
                   kvm_its_wake_retry_ms[retry]);
+    } else {
+        kvm_its_clear_blocked_msis(its);
     }
 }
 
@@ -116,23 +183,16 @@ static int kvm_its_send_msi(GICv3ITSState *s, uint32_t value, uint16_t devid)
     /* KVM_SIGNAL_MSI returns > 0 when the MSI was delivered. */
     kick = ret > 0 && kvm_arm_ffa_forward_enabled();
     trace_kvm_its_send_msi(devid, value, ret, kick);
+    if (ret == 0 && kvm_arm_ffa_forward_enabled()) {
+        /* The device edge occurred, but KVM blocked and dropped the MSI. */
+        kvm_its_queue_blocked_msi(its, &msi);
+    }
     if (kick) {
         CPU_FOREACH(cs) {
             if (!cs->secondary_tcg) {
                 qemu_cpu_kick(cs);
             }
         }
-
-        /*
-         * The immediate kick may be consumed while the guest masks IRQs,
-         * before it later enters WFI with the LPI still pending. Coalesce a
-         * bounded set of queued vCPU work items after the MSI burst; unlike a
-         * bare kick, queued work guarantees another KVM_RUN re-entry.
-         */
-        its->wake_retry = 0;
-        timer_mod(&its->wake_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-                  kvm_its_wake_retry_ms[0]);
     }
 
     return ret;
@@ -276,8 +336,7 @@ static void kvm_arm_its_reset_hold(Object *obj, ResetType type)
     KVMARMITSClass *c = KVM_ARM_ITS_GET_CLASS(s);
     int i;
 
-    timer_del(&its->wake_timer);
-    its->wake_retry = 0;
+    kvm_its_clear_blocked_msis(its);
 
     if (c->parent_phases.hold) {
         c->parent_phases.hold(obj, type);
@@ -319,6 +378,7 @@ static void kvm_arm_its_instance_init(Object *obj)
 {
     KVMARMITSState *its = KVM_ARM_ITS(obj);
 
+    g_queue_init(&its->blocked_msis);
     timer_init_ms(&its->wake_timer, QEMU_CLOCK_VIRTUAL,
                   kvm_its_wake_timer, its);
 }
@@ -327,7 +387,7 @@ static void kvm_arm_its_instance_finalize(Object *obj)
 {
     KVMARMITSState *its = KVM_ARM_ITS(obj);
 
-    timer_del(&its->wake_timer);
+    kvm_its_clear_blocked_msis(its);
 }
 
 static void kvm_arm_its_class_init(ObjectClass *klass, const void *data)
