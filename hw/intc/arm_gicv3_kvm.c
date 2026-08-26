@@ -21,6 +21,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "hw/intc/arm_gicv3_common.h"
 #include "hw/arm/virt.h"
 #include "qemu/error-report.h"
@@ -100,12 +101,55 @@ static inline void kvm_gicr_access(GICv3State *s, int offset, int cpu,
                       val, write, &error_abort);
 }
 
+static int kvm_gicc_access_err(GICv3State *s, uint64_t reg, int cpu,
+                               uint64_t *val, bool write, Error **errp)
+{
+    return kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS,
+                             KVM_VGIC_ATTR(reg, s->cpu[cpu].gicr_typer),
+                             val, write, errp);
+}
+
 static inline void kvm_gicc_access(GICv3State *s, uint64_t reg, int cpu,
                                    uint64_t *val, bool write)
 {
-    kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS,
-                      KVM_VGIC_ATTR(reg, s->cpu[cpu].gicr_typer),
-                      val, write, &error_abort);
+    kvm_gicc_access_err(s, reg, cpu, val, write, &error_abort);
+}
+
+typedef struct KVMGICv3DebugReg {
+    const char *name;
+    uint64_t reg;
+    unsigned int cpu;
+} KVMGICv3DebugReg;
+
+static KVMGICv3DebugReg kvm_gicv3_debug_regs[] = {
+    { "x-debug-cpu0-pmr", ICC_PMR_EL1, 0 },
+    { "x-debug-cpu0-igrpen0", ICC_IGRPEN0_EL1, 0 },
+    { "x-debug-cpu0-igrpen1", ICC_IGRPEN1_EL1, 0 },
+    { "x-debug-cpu0-ap1r0", ICC_AP1R_EL1(0), 0 },
+    { "x-debug-cpu1-pmr", ICC_PMR_EL1, 1 },
+    { "x-debug-cpu1-igrpen0", ICC_IGRPEN0_EL1, 1 },
+    { "x-debug-cpu1-igrpen1", ICC_IGRPEN1_EL1, 1 },
+    { "x-debug-cpu1-ap1r0", ICC_AP1R_EL1(0), 1 },
+};
+
+static void kvm_gicv3_get_debug_reg(Object *obj, Visitor *v,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    const KVMGICv3DebugReg *debug_reg = opaque;
+    GICv3State *s = ARM_GICV3_COMMON(obj);
+    uint64_t value = 0;
+
+    if (debug_reg->cpu >= s->num_cpu) {
+        error_setg(errp, "CPU %u is not present", debug_reg->cpu);
+        return;
+    }
+
+    if (kvm_gicc_access_err(s, debug_reg->reg, debug_reg->cpu,
+                            &value, false, errp) < 0) {
+        return;
+    }
+    visit_type_uint64(v, name, &value, errp);
 }
 
 static inline void kvm_gic_line_level_access(GICv3State *s, int irq, int cpu,
@@ -954,6 +998,15 @@ static void kvm_arm_gicv3_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
     ARMGICv3CommonClass *agcc = ARM_GICV3_COMMON_CLASS(klass);
     KVMARMGICv3Class *kgc = KVM_ARM_GICV3_CLASS(klass);
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(kvm_gicv3_debug_regs); i++) {
+        KVMGICv3DebugReg *debug_reg = &kvm_gicv3_debug_regs[i];
+
+        object_class_property_add(klass, debug_reg->name, "uint64",
+                                  kvm_gicv3_get_debug_reg,
+                      NULL, NULL, debug_reg);
+    }
 
     agcc->pre_save = kvm_arm_gicv3_get;
     agcc->post_load = kvm_arm_gicv3_put;

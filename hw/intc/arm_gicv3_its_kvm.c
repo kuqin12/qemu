@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
@@ -44,6 +45,15 @@ struct KVMARMITSState {
     QEMUTimer wake_timer;
     GQueue blocked_msis;
     unsigned int wake_retry;
+    uint64_t debug_msi_delivered;
+    uint64_t debug_msi_blocked;
+    uint64_t debug_msi_errors;
+    uint64_t debug_retry_delivered;
+    uint64_t debug_retry_blocked;
+    uint64_t debug_retry_errors;
+    uint64_t debug_blocked_depth;
+    uint64_t debug_last_devid;
+    uint64_t debug_last_eventid;
 };
 
 struct KVMARMITSClass {
@@ -51,9 +61,43 @@ struct KVMARMITSClass {
     ResettablePhases parent_phases;
 };
 
+typedef struct KVMITSDebugReg {
+    const char *name;
+    uint64_t reg;
+} KVMITSDebugReg;
+
+static KVMITSDebugReg kvm_its_debug_regs[] = {
+    { "x-debug-cbaser", GITS_CBASER },
+    { "x-debug-cwriter", GITS_CWRITER },
+    { "x-debug-creadr", GITS_CREADR },
+    { "x-debug-baser0", GITS_BASER },
+    { "x-debug-baser1", GITS_BASER + 8 },
+    { "x-debug-baser2", GITS_BASER + 16 },
+    { "x-debug-baser3", GITS_BASER + 24 },
+    { "x-debug-baser4", GITS_BASER + 32 },
+    { "x-debug-baser5", GITS_BASER + 40 },
+    { "x-debug-baser6", GITS_BASER + 48 },
+    { "x-debug-baser7", GITS_BASER + 56 },
+};
+
 static const unsigned int kvm_its_wake_retry_ms[] = {
     10, 100, 1000, 2000, 4000, 8000,
 };
+
+static void kvm_its_get_debug_reg(Object *obj, Visitor *v,
+                                  const char *name, void *opaque,
+                                  Error **errp)
+{
+    const KVMITSDebugReg *debug_reg = opaque;
+    GICv3ITSState *s = ARM_GICV3_ITS_COMMON(obj);
+    uint64_t value = 0;
+
+    if (kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                          debug_reg->reg, &value, false, errp) < 0) {
+        return;
+    }
+    visit_type_uint64(v, name, &value, errp);
+}
 
 static void kvm_its_wake_cpu(CPUState *cs, run_on_cpu_data data)
 {
@@ -88,6 +132,7 @@ static void kvm_its_clear_blocked_msis(KVMARMITSState *its)
     while (!g_queue_is_empty(&its->blocked_msis)) {
         g_free(g_queue_pop_head(&its->blocked_msis));
     }
+    its->debug_blocked_depth = 0;
 }
 
 static void kvm_its_queue_blocked_msi(KVMARMITSState *its,
@@ -106,6 +151,7 @@ static void kvm_its_queue_blocked_msi(KVMARMITSState *its,
     blocked = g_new(struct kvm_msi, 1);
     *blocked = *msi;
     g_queue_push_tail(&its->blocked_msis, blocked);
+    its->debug_blocked_depth++;
 
     its->wake_retry = 0;
     timer_mod(&its->wake_timer,
@@ -130,9 +176,19 @@ static void kvm_its_wake_timer(void *opaque)
         trace_kvm_its_wake_retry(blocked->devid, blocked->data,
                                  ret, retry + 1,
                                  kvm_its_wake_retry_ms[retry]);
+        its->debug_last_devid = blocked->devid;
+        its->debug_last_eventid = blocked->data;
+        if (ret > 0) {
+            its->debug_retry_delivered++;
+        } else if (ret == 0) {
+            its->debug_retry_blocked++;
+        } else {
+            its->debug_retry_errors++;
+        }
         if (ret != 0) {
             g_queue_delete_link(&its->blocked_msis, item);
             g_free(blocked);
+            its->debug_blocked_depth--;
             delivered |= ret > 0;
         }
         item = next;
@@ -183,6 +239,15 @@ static int kvm_its_send_msi(GICv3ITSState *s, uint32_t value, uint16_t devid)
     /* KVM_SIGNAL_MSI returns > 0 when the MSI was delivered. */
     kick = ret > 0 && kvm_arm_ffa_forward_enabled();
     trace_kvm_its_send_msi(devid, value, ret, kick);
+    its->debug_last_devid = devid;
+    its->debug_last_eventid = value;
+    if (ret > 0) {
+        its->debug_msi_delivered++;
+    } else if (ret == 0) {
+        its->debug_msi_blocked++;
+    } else {
+        its->debug_msi_errors++;
+    }
     if (ret == 0 && kvm_arm_ffa_forward_enabled()) {
         /* The device edge occurred, but KVM blocked and dropped the MSI. */
         kvm_its_queue_blocked_msi(its, &msi);
@@ -381,6 +446,24 @@ static void kvm_arm_its_instance_init(Object *obj)
     g_queue_init(&its->blocked_msis);
     timer_init_ms(&its->wake_timer, QEMU_CLOCK_VIRTUAL,
                   kvm_its_wake_timer, its);
+    object_property_add_uint64_ptr(obj, "x-debug-msi-delivered",
+        &its->debug_msi_delivered, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "x-debug-msi-blocked",
+        &its->debug_msi_blocked, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "x-debug-msi-errors",
+        &its->debug_msi_errors, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "x-debug-retry-delivered",
+        &its->debug_retry_delivered, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "x-debug-retry-blocked",
+        &its->debug_retry_blocked, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "x-debug-retry-errors",
+        &its->debug_retry_errors, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "x-debug-blocked-depth",
+        &its->debug_blocked_depth, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "x-debug-last-devid",
+        &its->debug_last_devid, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "x-debug-last-eventid",
+        &its->debug_last_eventid, OBJ_PROP_FLAG_READ);
 }
 
 static void kvm_arm_its_instance_finalize(Object *obj)
@@ -396,6 +479,15 @@ static void kvm_arm_its_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
     GICv3ITSCommonClass *icc = ARM_GICV3_ITS_COMMON_CLASS(klass);
     KVMARMITSClass *ic = KVM_ARM_ITS_CLASS(klass);
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(kvm_its_debug_regs); i++) {
+        KVMITSDebugReg *debug_reg = &kvm_its_debug_regs[i];
+
+        object_class_property_add(klass, debug_reg->name, "uint64",
+                                  kvm_its_get_debug_reg,
+                                  NULL, NULL, debug_reg);
+    }
 
     dc->realize = kvm_arm_its_realize;
     device_class_set_props(dc, kvm_arm_its_props);
