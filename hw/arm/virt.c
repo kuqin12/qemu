@@ -3713,11 +3713,6 @@ static void machvirt_init(MachineState *machine)
                      "hybrid-secure");
         exit(1);
     }
-    if (vms->hybrid_secure && !vms->hybrid_hibernate_state_file) {
-        error_report("mach-virt: hybrid-secure requires "
-                     "hybrid-hibernate-state-file");
-        exit(1);
-    }
     virt_hybrid_hibernate_marker_load(vms, &error_fatal);
 
     if (vms->hybrid_secure) {
