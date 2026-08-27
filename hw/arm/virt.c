@@ -29,6 +29,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "qemu/datadir.h"
 #include "qemu/units.h"
 #include "qemu/option.h"
@@ -44,6 +45,7 @@
 #include "system/device_tree.h"
 #include "system/numa.h"
 #include "system/runstate.h"
+#include "system/cpus.h"
 #include "system/tpm.h"
 #include "system/tcg.h"
 #include "system/kvm.h"
@@ -116,6 +118,136 @@ enum {
 
 #define HYBRID_SECURE_CALL_TIMEOUT_MS 5000
 #define HYBRID_SECURE_CANCEL_TIMEOUT_MS 1000
+#define HYBRID_HIBERNATE_MARKER "QEMU_ARM_HYBRID_S4_V1\n"
+#define HYBRID_FFA_SUCCESS 0x84000061U
+#define HYBRID_FFA_RXTX_MAP_32 0x84000066U
+#define HYBRID_FFA_RXTX_MAP_64 0xc4000066U
+#define HYBRID_FFA_RXTX_UNMAP 0x84000067U
+
+static bool virt_hybrid_hibernate_marker_load(VirtMachineState *vms,
+                                               Error **errp)
+{
+    g_autofree char *contents = NULL;
+    GError *gerr = NULL;
+    gsize length;
+
+    if (!vms->hybrid_hibernate_state_file) {
+        return true;
+    }
+
+    if (!g_file_get_contents(vms->hybrid_hibernate_state_file, &contents,
+                             &length, &gerr)) {
+        if (g_error_matches(gerr, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+            g_error_free(gerr);
+            return true;
+        }
+        error_setg(errp, "cannot read hybrid hibernation marker '%s': %s",
+                   vms->hybrid_hibernate_state_file, gerr->message);
+        g_error_free(gerr);
+        return false;
+    }
+    if (length != sizeof(HYBRID_HIBERNATE_MARKER) - 1 ||
+        memcmp(contents, HYBRID_HIBERNATE_MARKER, length)) {
+        error_setg(errp, "invalid hybrid hibernation marker '%s'",
+                   vms->hybrid_hibernate_state_file);
+        return false;
+    }
+
+    vms->hybrid_hibernate_marker_pending = true;
+    return true;
+}
+
+static bool virt_hybrid_hibernate_marker_sync_directory(
+    VirtMachineState *vms, Error **errp)
+{
+#ifdef _WIN32
+    return true;
+#else
+    g_autofree char *directory =
+        g_path_get_dirname(vms->hybrid_hibernate_state_file);
+    int fd;
+
+    fd = qemu_open(directory, O_RDONLY | O_DIRECTORY, errp);
+    if (fd < 0) {
+        return false;
+    }
+    if (fsync(fd)) {
+        error_setg_errno(errp, errno,
+                         "cannot flush hybrid hibernation marker directory "
+                         "'%s'", directory);
+        qemu_close(fd);
+        return false;
+    }
+    if (qemu_close(fd)) {
+        error_setg_errno(errp, errno,
+                         "cannot close hybrid hibernation marker directory "
+                         "'%s'", directory);
+        return false;
+    }
+
+    return true;
+#endif
+}
+
+static bool virt_hybrid_hibernate_marker_write(VirtMachineState *vms,
+                                                Error **errp)
+{
+    size_t length = sizeof(HYBRID_HIBERNATE_MARKER) - 1;
+    int fd;
+
+    fd = qemu_create(vms->hybrid_hibernate_state_file,
+                     O_WRONLY | O_EXCL | O_BINARY,
+                     S_IRUSR | S_IWUSR, errp);
+    if (fd < 0) {
+        return false;
+    }
+
+    if (qemu_write_full(fd, HYBRID_HIBERNATE_MARKER, length) != length) {
+        error_setg_errno(errp, errno,
+                         "cannot write hybrid hibernation marker '%s'",
+                         vms->hybrid_hibernate_state_file);
+        goto fail;
+    }
+    if (qemu_fdatasync(fd)) {
+        error_setg_errno(errp, errno,
+                         "cannot flush hybrid hibernation marker '%s'",
+                         vms->hybrid_hibernate_state_file);
+        goto fail;
+    }
+    if (qemu_close(fd)) {
+        fd = -1;
+        error_setg_errno(errp, errno,
+                         "cannot close hybrid hibernation marker '%s'",
+                         vms->hybrid_hibernate_state_file);
+        goto fail;
+    }
+    fd = -1;
+    if (!virt_hybrid_hibernate_marker_sync_directory(vms, errp)) {
+        goto fail;
+    }
+
+    return true;
+
+fail:
+    if (fd >= 0) {
+        qemu_close(fd);
+    }
+    qemu_unlink(vms->hybrid_hibernate_state_file);
+    return false;
+}
+
+static bool virt_hybrid_hibernate_marker_remove(VirtMachineState *vms,
+                                                 Error **errp)
+{
+    if (g_remove(vms->hybrid_hibernate_state_file) && errno != ENOENT) {
+        error_setg_errno(errp, errno,
+                         "cannot remove hybrid hibernation marker '%s'",
+                         vms->hybrid_hibernate_state_file);
+        return false;
+    }
+
+    return virt_hybrid_hibernate_marker_sync_directory(vms, errp);
+}
 
 /*
  * This cannot be called from the virt_machine_class_init() because
@@ -1136,6 +1268,10 @@ static void create_its(VirtMachineState *vms)
     object_property_set_link(OBJECT(dev), "parent-gicv3", OBJECT(vms->gic),
                              &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    vms->its = dev;
+    if (vms->hybrid_hibernate_marker_pending) {
+        ARM_GICV3_ITS_COMMON(dev)->hibernate_resume_pending = true;
+    }
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, vms->memmap[VIRT_GIC_ITS].base);
 
     fdt_add_its_gic_node(vms);
@@ -2596,12 +2732,101 @@ static void virt_hybrid_shadow_run_worker(VirtMachineState *vms)
     bql_lock();
 }
 
+static int virt_hybrid_prepare_hibernate(VirtMachineState *vms, Error **errp)
+{
+    int ret;
+
+    if (vms->hybrid_hibernate_marker_pending ||
+        vms->hybrid_hibernate_marker_created) {
+        error_setg(errp, "cannot prepare hibernation while a hibernation "
+                   "marker is active");
+        return -EBUSY;
+    }
+    if (!vms->its) {
+        error_setg(errp, "cannot prepare hibernation without an ITS");
+        return -ENODEV;
+    }
+
+    pause_all_primary_vcpus();
+    ret = gicv3_its_prepare_hibernate(vms->its, errp);
+    if (!ret && !virt_hybrid_hibernate_marker_write(vms, errp)) {
+        ret = -EIO;
+    }
+    if (!ret) {
+        vms->hybrid_hibernate_marker_created = true;
+        resume_all_primary_vcpus();
+    }
+
+    return ret;
+}
+
+static int virt_hybrid_resume_hibernate(VirtMachineState *vms, Error **errp)
+{
+    int ret;
+
+    if (vms->hybrid_hibernate_marker_created) {
+        pause_all_primary_vcpus();
+        ret = virt_hybrid_hibernate_marker_remove(vms, errp) ? 0 : -EIO;
+        if (!ret) {
+            vms->hybrid_hibernate_marker_created = false;
+            resume_all_primary_vcpus();
+        }
+        return ret;
+    }
+    if (!vms->hybrid_hibernate_marker_pending) {
+        return 0;
+    }
+    if (!vms->its) {
+        error_setg(errp, "cannot resume hibernation without an ITS");
+        return -ENODEV;
+    }
+
+    pause_all_primary_vcpus();
+    ret = gicv3_its_resume_hibernate(vms->its, errp);
+    if (!ret && !virt_hybrid_hibernate_marker_remove(vms, errp)) {
+        ret = -EIO;
+    }
+    if (!ret) {
+        vms->hybrid_hibernate_marker_pending = false;
+        ARM_GICV3_ITS_COMMON(vms->its)->hibernate_resume_pending = false;
+        resume_all_primary_vcpus();
+    }
+
+    return ret;
+}
+
+static int virt_hybrid_hibernate_transition(VirtMachineState *vms,
+                                             uint64_t function_id,
+                                             Error **errp)
+{
+    if (!vms->hybrid_hibernate_state_file) {
+        return 0;
+    }
+
+    switch (function_id) {
+    case HYBRID_FFA_RXTX_UNMAP:
+        return virt_hybrid_prepare_hibernate(vms, errp);
+    case HYBRID_FFA_RXTX_MAP_32:
+    case HYBRID_FFA_RXTX_MAP_64:
+        return virt_hybrid_resume_hibernate(vms, errp);
+    default:
+        return 0;
+    }
+}
+
 int arm_hybrid_ffa_call(uint64_t regs[18])
 {
     VirtMachineState *vms;
     uint64_t function_id = regs[0];
+    Error *hibernate_err = NULL;
+    bool hibernate_transition;
     bool timed_out = false;
+    int hibernate_ret = 0;
     int ret;
+
+    hibernate_transition = function_id == HYBRID_FFA_RXTX_UNMAP ||
+        function_id == HYBRID_FFA_RXTX_MAP_32 ||
+        function_id == HYBRID_FFA_RXTX_MAP_64;
 
     if (!current_machine ||
         !object_dynamic_cast(OBJECT(current_machine), TYPE_VIRT_MACHINE)) {
@@ -2656,6 +2881,7 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
             error_report("mach-virt: timed-out hybrid secure call 0x%"
                          PRIx64 " did not stop; stopping the VM",
                          function_id);
+            qemu_system_vmstop_request_prepare();
             qemu_system_vmstop_request(RUN_STATE_INTERNAL_ERROR);
             qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
             return -ETIMEDOUT;
@@ -2685,6 +2911,25 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
     } else {
         vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_READY;
     }
+    qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
+
+    if (!ret && regs[0] == HYBRID_FFA_SUCCESS && hibernate_transition &&
+        vms->hybrid_hibernate_state_file) {
+        bql_lock();
+        hibernate_ret = virt_hybrid_hibernate_transition(vms, function_id,
+                                                          &hibernate_err);
+        if (hibernate_ret) {
+            error_reportf_err(hibernate_err,
+                              "mach-virt: hybrid hibernation transition "
+                              "failed: ");
+            vms->hybrid_shadow_cpu->stopped = true;
+            qemu_system_vmstop_request_prepare();
+            qemu_system_vmstop_request(RUN_STATE_INTERNAL_ERROR);
+        }
+        bql_unlock();
+    }
+
+    qemu_mutex_lock(&vms->hybrid_shadow_mutex);
     vms->hybrid_runtime_inflight = false;
     qatomic_set(&vms->hybrid_runtime_cancel_requested, false);
     qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
@@ -3463,6 +3708,13 @@ static void machvirt_init(MachineState *machine)
     unsigned int smp_cpus = machine->smp.cpus;
     unsigned int max_cpus = machine->smp.max_cpus;
 
+    if (vms->hybrid_hibernate_state_file && !vms->hybrid_secure) {
+        error_report("mach-virt: hybrid-hibernate-state-file requires "
+                     "hybrid-secure");
+        exit(1);
+    }
+    virt_hybrid_hibernate_marker_load(vms, &error_fatal);
+
     if (vms->hybrid_secure) {
         if (!kvm_enabled()) {
             error_report("mach-virt: hybrid-secure requires KVM");
@@ -3815,6 +4067,14 @@ static void machvirt_init(MachineState *machine)
         create_hybrid_secure_gic(vms);
     }
     create_msi_controller(vms);
+    if (vms->hybrid_hibernate_state_file) {
+        if (!vms->its) {
+            error_report("mach-virt: hybrid-hibernate-state-file requires "
+                         "an ITS MSI controller");
+            exit(1);
+        }
+        gicv3_its_validate_hibernate(vms->its, &error_fatal);
+    }
 
     virt_post_cpus_gic_realized(vms, sysmem);
 
@@ -3953,6 +4213,33 @@ static void virt_set_hybrid_secure(Object *obj, bool value, Error **errp)
     VirtMachineState *vms = VIRT_MACHINE(obj);
 
     vms->hybrid_secure = value;
+}
+
+static char *virt_get_hybrid_hibernate_state_file(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    return g_strdup(vms->hybrid_hibernate_state_file);
+}
+
+static void virt_set_hybrid_hibernate_state_file(Object *obj,
+                                                  const char *value,
+                                                  Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    if (phase_check(PHASE_MACHINE_INITIALIZED)) {
+        error_setg(errp, "hybrid-hibernate-state-file cannot be changed "
+                   "after machine initialization");
+        return;
+    }
+    if (!value || !value[0]) {
+        error_setg(errp, "hybrid-hibernate-state-file cannot be empty");
+        return;
+    }
+
+    g_free(vms->hybrid_hibernate_state_file);
+    vms->hybrid_hibernate_state_file = g_strdup(value);
 }
 
 static bool virt_get_hybrid_shadow_ready(Object *obj, Error **errp)
@@ -5019,6 +5306,13 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "hybrid-secure",
         "Initialize a shadow TCG secure execution domain");
 
+    object_class_property_add_str(oc, "hybrid-hibernate-state-file",
+        virt_get_hybrid_hibernate_state_file,
+        virt_set_hybrid_hibernate_state_file);
+    object_class_property_set_description(oc,
+        "hybrid-hibernate-state-file",
+        "Persist an OS-originated hybrid hibernation marker");
+
     object_class_property_add_bool(oc, "hybrid-shadow-ready",
                                    virt_get_hybrid_shadow_ready, NULL);
     object_class_property_set_description(oc, "hybrid-shadow-ready",
@@ -5277,6 +5571,7 @@ static void virt_instance_finalize(Object *obj)
     }
     g_free(vms->oem_id);
     g_free(vms->oem_table_id);
+    g_free(vms->hybrid_hibernate_state_file);
 }
 
 static const TypeInfo virt_machine_info = {

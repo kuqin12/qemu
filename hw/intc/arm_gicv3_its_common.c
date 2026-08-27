@@ -49,6 +49,46 @@ static int gicv3_its_post_load(void *opaque, int version_id)
     return 0;
 }
 
+int gicv3_its_validate_hibernate(DeviceState *dev, Error **errp)
+{
+    GICv3ITSState *s = ARM_GICV3_ITS_COMMON(dev);
+    GICv3ITSCommonClass *c = ARM_GICV3_ITS_COMMON_GET_CLASS(s);
+
+    if (!c->validate_hibernate || !c->prepare_hibernate ||
+        !c->resume_hibernate) {
+        error_setg(errp, "ITS does not support hybrid hibernation");
+        return -ENOTSUP;
+    }
+
+    return c->validate_hibernate(s, errp);
+}
+
+int gicv3_its_prepare_hibernate(DeviceState *dev, Error **errp)
+{
+    GICv3ITSState *s = ARM_GICV3_ITS_COMMON(dev);
+    GICv3ITSCommonClass *c = ARM_GICV3_ITS_COMMON_GET_CLASS(s);
+
+    if (!c->prepare_hibernate) {
+        error_setg(errp, "ITS does not support hybrid hibernation save");
+        return -ENOTSUP;
+    }
+
+    return c->prepare_hibernate(s, errp);
+}
+
+int gicv3_its_resume_hibernate(DeviceState *dev, Error **errp)
+{
+    GICv3ITSState *s = ARM_GICV3_ITS_COMMON(dev);
+    GICv3ITSCommonClass *c = ARM_GICV3_ITS_COMMON_GET_CLASS(s);
+
+    if (!c->resume_hibernate) {
+        error_setg(errp, "ITS does not support hybrid hibernation restore");
+        return -ENOTSUP;
+    }
+
+    return c->resume_hibernate(s, errp);
+}
+
 static const VMStateDescription vmstate_its = {
     .name = "arm_gicv3_its",
     .pre_save = gicv3_its_pre_save,

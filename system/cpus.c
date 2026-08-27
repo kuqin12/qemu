@@ -639,6 +639,19 @@ static bool all_vcpus_paused(void)
     return true;
 }
 
+static bool all_primary_vcpus_paused(void)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        if (!cpu->secondary_tcg && !cpu->stopped) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void pause_all_vcpus(void)
 {
     CPUState *cpu;
@@ -666,6 +679,38 @@ void pause_all_vcpus(void)
     bql_lock();
 }
 
+void pause_all_primary_vcpus(void)
+{
+    CPUState *cpu;
+    bool in_vcpu_thread = qemu_in_vcpu_thread();
+
+    qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false);
+    CPU_FOREACH(cpu) {
+        if (!cpu->secondary_tcg) {
+            cpu_pause(cpu);
+        }
+    }
+
+    if (!in_vcpu_thread) {
+        replay_mutex_unlock();
+    }
+
+    while (!all_primary_vcpus_paused()) {
+        qemu_cond_wait(&qemu_pause_cond, &bql);
+        CPU_FOREACH(cpu) {
+            if (!cpu->secondary_tcg) {
+                qemu_cpu_kick(cpu);
+            }
+        }
+    }
+
+    if (!in_vcpu_thread) {
+        bql_unlock();
+        replay_mutex_lock();
+        bql_lock();
+    }
+}
+
 void resume_all_vcpus(void)
 {
     CPUState *cpu;
@@ -677,6 +722,22 @@ void resume_all_vcpus(void)
     qemu_clock_enable(QEMU_CLOCK_VIRTUAL, true);
     CPU_FOREACH(cpu) {
         cpu_resume(cpu);
+    }
+}
+
+void resume_all_primary_vcpus(void)
+{
+    CPUState *cpu;
+
+    if (!runstate_is_running()) {
+        return;
+    }
+
+    qemu_clock_enable(QEMU_CLOCK_VIRTUAL, true);
+    CPU_FOREACH(cpu) {
+        if (!cpu->secondary_tcg) {
+            cpu_resume(cpu);
+        }
     }
 }
 

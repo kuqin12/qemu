@@ -24,6 +24,7 @@
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "hw/intc/arm_gicv3_its_common.h"
+#include "gicv3_internal.h"
 #include "hw/core/cpu.h"
 #include "hw/core/qdev-properties.h"
 #include "system/runstate.h"
@@ -214,6 +215,10 @@ static void vm_change_state_handler(void *opaque, bool running,
         return;
     }
 
+    if (s->hibernate_resume_pending) {
+        return;
+    }
+
     kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
                       KVM_DEV_ARM_ITS_SAVE_TABLES, NULL, true, &err);
     if (err) {
@@ -329,6 +334,103 @@ static void kvm_arm_its_post_load(GICv3ITSState *s)
                       GITS_CTLR, &s->ctlr, true, &error_abort);
 }
 
+static int kvm_arm_its_validate_hibernate(GICv3ITSState *s, Error **errp)
+{
+    if (!kvm_device_check_attr(s->dev_fd,
+                               KVM_DEV_ARM_VGIC_GRP_ITS_REGS, GITS_CTLR) ||
+        !kvm_device_check_attr(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
+                               KVM_DEV_ARM_ITS_SAVE_TABLES) ||
+        !kvm_device_check_attr(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
+                               KVM_DEV_ARM_ITS_RESTORE_TABLES)) {
+        error_setg(errp, "host KVM ITS does not support hybrid hibernation");
+        return -ENOTSUP;
+    }
+
+    return 0;
+}
+
+static int kvm_arm_its_prepare_hibernate(GICv3ITSState *s, Error **errp)
+{
+    return kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
+                             KVM_DEV_ARM_ITS_SAVE_TABLES, NULL, true, errp);
+}
+
+static int kvm_arm_its_resume_hibernate(GICv3ITSState *s, Error **errp)
+{
+    uint64_t baser[ARRAY_SIZE(s->baser)] = { 0 };
+    uint64_t disabled_ctlr;
+    uint64_t cbaser = 0;
+    uint64_t ctlr = 0;
+    Error *local_err = NULL;
+    Error *enable_err = NULL;
+    bool collection_table_valid = false;
+    bool device_table_valid = false;
+    int ret = 0;
+    int enable_ret;
+    int i;
+
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_CTLR, &ctlr, false, &local_err);
+    if (ret) {
+        goto out;
+    }
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_CBASER, &cbaser, false, &local_err);
+    if (ret) {
+        goto out;
+    }
+    for (i = 0; i < ARRAY_SIZE(baser); i++) {
+        uint64_t type;
+
+        ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                                GITS_BASER + i * 8, &baser[i], false,
+                                &local_err);
+        if (ret) {
+            goto out;
+        }
+        if (!FIELD_EX64(baser[i], GITS_BASER, VALID)) {
+            continue;
+        }
+        type = FIELD_EX64(baser[i], GITS_BASER, TYPE);
+        device_table_valid |= type == GITS_BASER_TYPE_DEVICE;
+        collection_table_valid |= type == GITS_BASER_TYPE_COLLECTION;
+    }
+
+    if (!(ctlr & R_GITS_CTLR_ENABLED_MASK) ||
+        !FIELD_EX64(cbaser, GITS_CBASER, VALID) ||
+        !device_table_valid || !collection_table_valid) {
+        error_setg(&local_err, "KVM ITS registers are not ready for "
+                   "hibernate restore");
+        ret = -EINVAL;
+        goto out;
+    }
+
+    disabled_ctlr = ctlr & ~R_GITS_CTLR_ENABLED_MASK;
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                            GITS_CTLR, &disabled_ctlr, true, &local_err);
+    if (ret) {
+        goto out;
+    }
+
+    ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
+                            KVM_DEV_ARM_ITS_RESTORE_TABLES, NULL, true,
+                            &local_err);
+    enable_ret = kvm_device_access(s->dev_fd,
+                                   KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                                   GITS_CTLR, &ctlr, true, &enable_err);
+    if (!ret && enable_ret) {
+        ret = enable_ret;
+        local_err = enable_err;
+        enable_err = NULL;
+    } else if (enable_err) {
+        error_report_err(enable_err);
+    }
+
+out:
+    error_propagate(errp, local_err);
+    return ret;
+}
+
 static void kvm_arm_its_reset_hold(Object *obj, ResetType type)
 {
     GICv3ITSState *s = ARM_GICV3_ITS_COMMON(obj);
@@ -404,6 +506,9 @@ static void kvm_arm_its_class_init(ObjectClass *klass, const void *data)
     icc->send_msi = kvm_its_send_msi;
     icc->pre_save = kvm_arm_its_pre_save;
     icc->post_load = kvm_arm_its_post_load;
+    icc->validate_hibernate = kvm_arm_its_validate_hibernate;
+    icc->prepare_hibernate = kvm_arm_its_prepare_hibernate;
+    icc->resume_hibernate = kvm_arm_its_resume_hibernate;
 }
 
 static const TypeInfo kvm_arm_its_info = {

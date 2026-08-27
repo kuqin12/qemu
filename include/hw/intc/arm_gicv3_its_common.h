@@ -82,6 +82,7 @@ struct GICv3ITSState {
     CmdQDesc   cq;
 
     Error *migration_blocker;
+    bool hibernate_resume_pending;
 };
 
 typedef struct GICv3ITSState GICv3ITSState;
@@ -120,7 +121,14 @@ struct GICv3ITSCommonClass {
     int (*send_msi)(GICv3ITSState *s, uint32_t data, uint16_t devid);
     void (*pre_save)(GICv3ITSState *s);
     void (*post_load)(GICv3ITSState *s);
+    int (*validate_hibernate)(GICv3ITSState *s, Error **errp);
+    int (*prepare_hibernate)(GICv3ITSState *s, Error **errp);
+    int (*resume_hibernate)(GICv3ITSState *s, Error **errp);
 };
+
+int gicv3_its_validate_hibernate(DeviceState *dev, Error **errp);
+int gicv3_its_prepare_hibernate(DeviceState *dev, Error **errp);
+int gicv3_its_resume_hibernate(DeviceState *dev, Error **errp);
 
 /**
  * its_class_name:

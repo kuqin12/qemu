@@ -181,6 +181,8 @@ struct VirtMachineState {
     bool hybrid_shadow_worker_stop;
     bool hybrid_runtime_inflight;
     bool hybrid_runtime_cancel_requested;
+    bool hybrid_hibernate_marker_pending;
+    bool hybrid_hibernate_marker_created;
     unsigned int hybrid_shadow_stage;
     uint32_t hybrid_secure_call_timeout_ms;
     uint64_t hybrid_shadow_smoke_x0;
@@ -225,6 +227,7 @@ struct VirtMachineState {
     uint8_t virtio_transports;
     hwaddr highest_gpa;
     DeviceState *gic;
+    DeviceState *its;
     DeviceState *hybrid_secure_gic;
     DeviceState *hybrid_secure_platform_bus_dev;
     CPUState *hybrid_shadow_cpu;
@@ -241,6 +244,7 @@ struct VirtMachineState {
     CXLState cxl_devices_state;
     bool legacy_smmuv3_present;
     Error *hybrid_migration_blocker;
+    char *hybrid_hibernate_state_file;
     MemoryRegion *hybrid_smc_trampoline;
     MemoryRegion *sysmem;
     MemoryRegion *secure_sysmem;
