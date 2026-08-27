@@ -231,6 +231,7 @@ int kvm_arm_set_bl33_handoff(ARMCPU *cpu, uint64_t entry,
                              const uint64_t xregs[31]);
 
 int arm_hybrid_ffa_call(uint64_t regs[18]);
+int arm_hybrid_system_off(bool require_hibernate);
 int arm_hybrid_system_reset(uint64_t regs[18], bool warm);
 
 void kvm_arm_enable_mte(Object *cpuobj, Error **errp);

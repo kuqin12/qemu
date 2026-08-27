@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 
 #include <linux/kvm.h>
+#include <linux/psci.h>
 
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
@@ -632,7 +633,8 @@ static int kvm_arm_set_smccc_filter(KVMState *s, uint32_t base,
     return kvm_vm_ioctl(s, KVM_SET_DEVICE_ATTR, &attr);
 }
 
-static int kvm_arm_init_ffa_forwarding(KVMState *s)
+static int kvm_arm_init_ffa_forwarding(KVMState *s,
+                                        bool hibernate_recovery)
 {
     struct kvm_device_attr attr = {
         .group = KVM_ARM_VM_SMCCC_CTRL,
@@ -663,6 +665,29 @@ static int kvm_arm_init_ffa_forwarding(KVMState *s)
         error_report("Failed to install KVM FF-A SMC64 filter: %s",
                      strerror(-ret));
         return ret;
+    }
+
+    if (hibernate_recovery) {
+        ret = kvm_arm_set_smccc_filter(s, PSCI_0_2_FN_SYSTEM_OFF, 1);
+        if (ret) {
+            error_report("Failed to install KVM PSCI SYSTEM_OFF filter: %s",
+                         strerror(-ret));
+            return ret;
+        }
+
+        ret = kvm_arm_set_smccc_filter(s, PSCI_1_3_FN_SYSTEM_OFF2, 1);
+        if (ret) {
+            error_report("Failed to install KVM PSCI SYSTEM_OFF2 filter: %s",
+                         strerror(-ret));
+            return ret;
+        }
+
+        ret = kvm_arm_set_smccc_filter(s, PSCI_1_3_FN64_SYSTEM_OFF2, 1);
+        if (ret) {
+            error_report("Failed to install KVM PSCI SYSTEM_OFF2_64 "
+                         "filter: %s", strerror(-ret));
+            return ret;
+        }
     }
 
     ret = kvm_arm_set_smccc_filter(s, KVM_ARM_PSCI_SYSTEM_RESET, 1);
@@ -696,6 +721,7 @@ static int kvm_arm_init_ffa_forwarding(KVMState *s)
 
 int kvm_arch_init(MachineState *ms, KVMState *s)
 {
+    g_autofree char *hibernate_state_file = NULL;
     int ret = 0;
     /* For ARM interrupt delivery is always asynchronous,
      * whether we are using an in-kernel VGIC or not.
@@ -715,7 +741,13 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
         kvm_check_extension(s, KVM_CAP_ARM_INJECT_SERROR_ESR);
 
     if (s->arm_ffa_forward) {
-        ret = kvm_arm_init_ffa_forwarding(s);
+        if (object_property_find(OBJECT(ms),
+                                 "hybrid-hibernate-state-file")) {
+            hibernate_state_file = object_property_get_str(
+                OBJECT(ms), "hybrid-hibernate-state-file", NULL);
+        }
+        ret = kvm_arm_init_ffa_forwarding(
+            s, hibernate_state_file && hibernate_state_file[0]);
         if (ret) {
             return ret;
         }
@@ -1696,6 +1728,9 @@ static int kvm_arm_handle_smccc_hypercall(CPUState *cs, struct kvm_run *run)
     if (!s->arm_ffa_forward ||
         !(run->hypercall.flags & KVM_HYPERCALL_EXIT_SMC) ||
         (!kvm_arm_is_ffa_call(func_id) &&
+         func_id != PSCI_0_2_FN_SYSTEM_OFF &&
+         func_id != PSCI_1_3_FN_SYSTEM_OFF2 &&
+         func_id != PSCI_1_3_FN64_SYSTEM_OFF2 &&
          func_id != KVM_ARM_PSCI_SYSTEM_RESET &&
          func_id != KVM_ARM_PSCI_FEATURES &&
          func_id != KVM_ARM_PSCI_SYSTEM_RESET2 &&
@@ -1704,6 +1739,44 @@ static int kvm_arm_handle_smccc_hypercall(CPUState *cs, struct kvm_run *run)
                      ", flags 0x%" PRIx64, func_id,
                      (uint64_t)run->hypercall.flags);
         return -EINVAL;
+    }
+
+    if (func_id == PSCI_0_2_FN_SYSTEM_OFF ||
+        func_id == PSCI_1_3_FN_SYSTEM_OFF2 ||
+        func_id == PSCI_1_3_FN64_SYSTEM_OFF2) {
+        bool require_hibernate = func_id != PSCI_0_2_FN_SYSTEM_OFF;
+        int ret;
+
+        kvm_cpu_synchronize_state(cs);
+        if (!is_a64(env)) {
+            env->regs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
+            run->hypercall.ret = env->regs[0];
+            return 0;
+        }
+        if (require_hibernate) {
+            if (env->xregs[1] != PSCI_1_3_OFF_TYPE_HIBERNATE_OFF) {
+                env->xregs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
+                run->hypercall.ret = env->xregs[0];
+                return 0;
+            }
+        }
+
+        ret = arm_hybrid_system_off(require_hibernate);
+        if (ret == -ENOTSUP) {
+            env->xregs[0] = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
+            run->hypercall.ret = env->xregs[0];
+            return 0;
+        }
+        if (ret) {
+            vm_stop(RUN_STATE_INTERNAL_ERROR);
+            run->hypercall.ret = KVM_ARM_PSCI_RET_NOT_SUPPORTED;
+            return 0;
+        }
+
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        cpu_stop_current();
+        run->hypercall.ret = 0;
+        return 0;
     }
 
     if (func_id == KVM_ARM_PSCI_SYSTEM_RESET ||

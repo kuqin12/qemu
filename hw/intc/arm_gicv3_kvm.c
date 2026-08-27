@@ -760,6 +760,10 @@ static void vm_change_state_handler(void *opaque, bool running,
         return;
     }
 
+    if (s->hibernate_resume_pending) {
+        return;
+    }
+
     ret = kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
                            KVM_DEV_ARM_VGIC_SAVE_PENDING_TABLES,
                            NULL, true, &err);
@@ -769,6 +773,13 @@ static void vm_change_state_handler(void *opaque, bool running,
     if (ret < 0 && ret != -EFAULT) {
         abort();
     }
+}
+
+static int kvm_arm_gicv3_prepare_hibernate(GICv3State *s, Error **errp)
+{
+    return kvm_device_access(s->dev_fd, KVM_DEV_ARM_VGIC_GRP_CTRL,
+                             KVM_DEV_ARM_VGIC_SAVE_PENDING_TABLES,
+                             NULL, true, errp);
 }
 
 static int kvm_arm_gicv3_notifier(NotifierWithReturn *notifier,
@@ -957,6 +968,7 @@ static void kvm_arm_gicv3_class_init(ObjectClass *klass, const void *data)
 
     agcc->pre_save = kvm_arm_gicv3_get;
     agcc->post_load = kvm_arm_gicv3_put;
+    agcc->prepare_hibernate = kvm_arm_gicv3_prepare_hibernate;
     device_class_set_parent_realize(dc, kvm_arm_gicv3_realize,
                                     &kgc->parent_realize);
     resettable_class_set_parent_phases(rc, NULL, kvm_arm_gicv3_reset_hold, NULL,

@@ -279,6 +279,7 @@ struct GICv3State {
     GPtrArray *itslist;
 
     NotifierWithReturn cpr_notifier;
+    bool hibernate_resume_pending;
 };
 
 #define GICV3_BITMAP_ACCESSORS(BMP)                                     \
@@ -325,7 +326,10 @@ struct ARMGICv3CommonClass {
 
     void (*pre_save)(GICv3State *s);
     void (*post_load)(GICv3State *s);
+    int (*prepare_hibernate)(GICv3State *s, Error **errp);
 };
+
+int gicv3_prepare_hibernate(DeviceState *dev, Error **errp);
 
 void gicv3_init_irqs_and_mmio(GICv3State *s, qemu_irq_handler handler,
                               const MemoryRegionOps *ops);

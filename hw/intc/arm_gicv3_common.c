@@ -95,6 +95,19 @@ static int gicv3_post_load(void *opaque, int version_id)
     return 0;
 }
 
+int gicv3_prepare_hibernate(DeviceState *dev, Error **errp)
+{
+    GICv3State *s = ARM_GICV3_COMMON(dev);
+    ARMGICv3CommonClass *c = ARM_GICV3_COMMON_GET_CLASS(s);
+
+    if (!c->prepare_hibernate) {
+        error_setg(errp, "GICv3 does not support hibernation save");
+        return -ENOTSUP;
+    }
+
+    return c->prepare_hibernate(s, errp);
+}
+
 static bool virt_state_needed(void *opaque)
 {
     GICv3CPUState *cs = opaque;
