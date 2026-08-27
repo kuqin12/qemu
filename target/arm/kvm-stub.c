@@ -42,6 +42,11 @@ bool kvm_arm_el2_supported(void)
     return false;
 }
 
+bool kvm_arm_ffa_forward_enabled(void)
+{
+    return false;
+}
+
 /*
  * These functions should never actually be called without KVM support.
  */
