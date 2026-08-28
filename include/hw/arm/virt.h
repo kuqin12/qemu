@@ -253,6 +253,7 @@ struct VirtMachineState {
     bool legacy_smmuv3_present;
     Error *hybrid_migration_blocker;
     char *hybrid_hibernate_state_file;
+    GPtrArray *hybrid_hibernate_pci_states;
     MemoryRegion *hybrid_smc_trampoline;
     MemoryRegion *sysmem;
     MemoryRegion *secure_sysmem;

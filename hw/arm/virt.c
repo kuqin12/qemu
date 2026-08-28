@@ -60,7 +60,10 @@
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
+#include "hw/pci/pci.h"
 #include "hw/pci/pci_bus.h"
+#include "hw/pci/pci_bridge.h"
+#include "hw/pci/pci_host.h"
 #include "hw/pci-host/gpex.h"
 #include "hw/pci-bridge/pci_expander_bridge.h"
 #include "hw/virtio/virtio-pci.h"
@@ -119,13 +122,172 @@ enum {
 #define HYBRID_SECURE_CALL_TIMEOUT_MS 5000
 #define HYBRID_SECURE_CANCEL_TIMEOUT_MS 1000
 #define HYBRID_HIBERNATE_GROUP "qemu-arm-hybrid-s4"
-#define HYBRID_HIBERNATE_VERSION 2
-#define HYBRID_HIBERNATE_MARKER_MAX_SIZE 4096
+#define HYBRID_HIBERNATE_PCI_GROUP "pci-device-%u"
+#define HYBRID_HIBERNATE_VERSION 3
+#define HYBRID_HIBERNATE_MARKER_MAX_SIZE MiB
+#define HYBRID_HIBERNATE_PCI_DEVICE_MAX 256
 #define HYBRID_FFA_PAGE_SIZE 4096
 #define HYBRID_FFA_SUCCESS 0x84000061U
 #define HYBRID_FFA_RXTX_MAP_32 0x84000066U
 #define HYBRID_FFA_RXTX_MAP_64 0xc4000066U
 #define HYBRID_FFA_RXTX_UNMAP 0x84000067U
+
+typedef struct VirtHybridPCIDeviceState {
+    char *qom_type;
+    uint16_t bdf;
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint16_t command;
+    uint32_t class_revision;
+    uint8_t header_type;
+    uint32_t bar[PCI_NUM_REGIONS];
+    uint64_t region_address[PCI_NUM_REGIONS];
+    uint64_t region_size[PCI_NUM_REGIONS];
+    uint8_t region_type[PCI_NUM_REGIONS];
+} VirtHybridPCIDeviceState;
+
+typedef struct VirtHybridPCIMarkerContext {
+    VirtMachineState *vms;
+    GKeyFile *key_file;
+    Error **errp;
+    unsigned int count;
+} VirtHybridPCIMarkerContext;
+
+static void virt_hybrid_hibernate_pci_state_free(gpointer opaque)
+{
+    VirtHybridPCIDeviceState *state = opaque;
+
+    g_free(state->qom_type);
+    g_free(state);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(VirtHybridPCIDeviceState,
+                              virt_hybrid_hibernate_pci_state_free)
+
+static bool virt_hybrid_hibernate_marker_get_uint64(
+    GKeyFile *key_file, const char *group, const char *key,
+    uint64_t *value, Error **errp)
+{
+    GError *gerr = NULL;
+
+    *value = g_key_file_get_uint64(key_file, group, key, &gerr);
+    if (!gerr) {
+        return true;
+    }
+
+    error_setg(errp, "invalid hybrid hibernation marker field [%s] %s: %s",
+               group, key, gerr->message);
+    g_error_free(gerr);
+    return false;
+}
+
+static bool virt_hybrid_hibernate_marker_get_bounded_uint64(
+    GKeyFile *key_file, const char *group, const char *key,
+    uint64_t maximum, uint64_t *value, Error **errp)
+{
+    if (!virt_hybrid_hibernate_marker_get_uint64(key_file, group, key,
+                                                  value, errp)) {
+        return false;
+    }
+    if (*value > maximum) {
+        error_setg(errp, "hybrid hibernation marker field [%s] %s is "
+                   "out of range", group, key);
+        return false;
+    }
+    return true;
+}
+
+static bool virt_hybrid_hibernate_pci_state_load(
+    VirtMachineState *vms, GKeyFile *key_file, Error **errp)
+{
+    uint64_t count;
+    unsigned int i;
+
+    if (!virt_hybrid_hibernate_marker_get_bounded_uint64(
+            key_file, HYBRID_HIBERNATE_GROUP, "pci-device-count",
+            HYBRID_HIBERNATE_PCI_DEVICE_MAX, &count, errp) || !count) {
+        if (!*errp) {
+            error_setg(errp, "hybrid hibernation marker has no PCI state");
+        }
+        return false;
+    }
+
+    g_ptr_array_set_size(vms->hybrid_hibernate_pci_states, 0);
+    for (i = 0; i < count; i++) {
+        g_autofree char *group =
+            g_strdup_printf(HYBRID_HIBERNATE_PCI_GROUP, i);
+        g_autoptr(GError) gerr = NULL;
+        g_autofree char *qom_type = NULL;
+        g_autoptr(VirtHybridPCIDeviceState) state = g_new0(
+            VirtHybridPCIDeviceState, 1);
+        uint64_t value;
+        unsigned int region;
+
+        qom_type = g_key_file_get_string(key_file, group, "qom-type",
+                                         &gerr);
+        if (gerr || !qom_type[0]) {
+            error_setg(errp, "invalid hybrid hibernation marker PCI type "
+                       "[%s]: %s", group,
+                       gerr ? gerr->message : "empty type");
+            return false;
+        }
+        state->qom_type = g_steal_pointer(&qom_type);
+
+#define LOAD_PCI_FIELD(_key, _maximum, _field)                         \
+        do {                                                           \
+            if (!virt_hybrid_hibernate_marker_get_bounded_uint64(      \
+                    key_file, group, (_key), (_maximum), &value,       \
+                    errp)) {                                           \
+                return false;                                          \
+            }                                                          \
+            state->_field = value;                                     \
+        } while (0)
+
+        LOAD_PCI_FIELD("bdf", UINT16_MAX, bdf);
+        LOAD_PCI_FIELD("vendor-id", UINT16_MAX, vendor_id);
+        LOAD_PCI_FIELD("device-id", UINT16_MAX, device_id);
+        LOAD_PCI_FIELD("command", UINT16_MAX, command);
+        LOAD_PCI_FIELD("class-revision", UINT32_MAX, class_revision);
+        LOAD_PCI_FIELD("header-type", UINT8_MAX, header_type);
+        for (region = 0; region < PCI_NUM_REGIONS; region++) {
+            g_autofree char *bar_key = g_strdup_printf("bar-%u", region);
+            g_autofree char *address_key =
+                g_strdup_printf("region-address-%u", region);
+            g_autofree char *size_key =
+                g_strdup_printf("region-size-%u", region);
+            g_autofree char *type_key =
+                g_strdup_printf("region-type-%u", region);
+
+            LOAD_PCI_FIELD(bar_key, UINT32_MAX, bar[region]);
+            if (!virt_hybrid_hibernate_marker_get_uint64(
+                    key_file, group, address_key,
+                    &state->region_address[region], errp) ||
+                !virt_hybrid_hibernate_marker_get_uint64(
+                    key_file, group, size_key,
+                    &state->region_size[region], errp)) {
+                return false;
+            }
+            LOAD_PCI_FIELD(type_key, UINT8_MAX, region_type[region]);
+        }
+#undef LOAD_PCI_FIELD
+
+        for (region = 0; region < vms->hybrid_hibernate_pci_states->len;
+             region++) {
+            VirtHybridPCIDeviceState *previous =
+                g_ptr_array_index(vms->hybrid_hibernate_pci_states, region);
+
+            if (previous->bdf == state->bdf) {
+                error_setg(errp, "duplicate PCI BDF 0x%x in hybrid "
+                           "hibernation marker", state->bdf);
+                return false;
+            }
+        }
+        g_ptr_array_add(vms->hybrid_hibernate_pci_states,
+                        g_steal_pointer(&state));
+    }
+
+    return true;
+}
 
 static bool virt_hybrid_hibernate_tuple_valid(uint64_t tx_pa,
                                                uint64_t rx_pa,
@@ -201,6 +363,10 @@ static bool virt_hybrid_hibernate_marker_load(VirtMachineState *vms,
         g_clear_error(&gerr);
         return false;
     }
+    if (!virt_hybrid_hibernate_pci_state_load(vms, key_file, errp)) {
+        g_ptr_array_set_size(vms->hybrid_hibernate_pci_states, 0);
+        return false;
+    }
 
     vms->hybrid_hibernate_marker_pending = true;
     return true;
@@ -238,6 +404,95 @@ static bool virt_hybrid_hibernate_marker_sync_directory(
 #endif
 }
 
+static void virt_hybrid_hibernate_pci_marker_add(PCIBus *bus,
+                                                  PCIDevice *dev,
+                                                  void *opaque)
+{
+    VirtHybridPCIMarkerContext *context = opaque;
+    g_autofree char *group = NULL;
+    unsigned int region;
+
+    if (*context->errp) {
+        return;
+    }
+    if (bus != context->vms->bus || IS_PCI_BRIDGE(dev) || pci_is_vf(dev)) {
+        error_setg(context->errp, "hybrid hibernation does not support "
+                   "PCI bridges or virtual functions");
+        return;
+    }
+    if (context->count >= HYBRID_HIBERNATE_PCI_DEVICE_MAX) {
+        error_setg(context->errp, "too many PCI devices for hybrid "
+                   "hibernation");
+        return;
+    }
+
+    group = g_strdup_printf(HYBRID_HIBERNATE_PCI_GROUP, context->count++);
+    g_key_file_set_string(context->key_file, group, "qom-type",
+                          object_get_typename(OBJECT(dev)));
+    g_key_file_set_uint64(context->key_file, group, "bdf",
+                          pci_get_bdf(dev));
+    g_key_file_set_uint64(context->key_file, group, "vendor-id",
+                          pci_get_word(dev->config + PCI_VENDOR_ID));
+    g_key_file_set_uint64(context->key_file, group, "device-id",
+                          pci_get_word(dev->config + PCI_DEVICE_ID));
+    g_key_file_set_uint64(context->key_file, group, "command",
+                          pci_get_word(dev->config + PCI_COMMAND));
+    g_key_file_set_uint64(context->key_file, group, "class-revision",
+                          pci_get_long(dev->config + PCI_CLASS_REVISION));
+    g_key_file_set_uint64(context->key_file, group, "header-type",
+                          pci_get_byte(dev->config + PCI_HEADER_TYPE));
+
+    for (region = 0; region < PCI_NUM_REGIONS; region++) {
+        PCIIORegion *io_region = &dev->io_regions[region];
+        g_autofree char *bar_key = g_strdup_printf("bar-%u", region);
+        g_autofree char *address_key =
+            g_strdup_printf("region-address-%u", region);
+        g_autofree char *size_key =
+            g_strdup_printf("region-size-%u", region);
+        g_autofree char *type_key =
+            g_strdup_printf("region-type-%u", region);
+
+        g_key_file_set_uint64(context->key_file, group, bar_key,
+                              pci_get_long(dev->config +
+                                           pci_bar(dev, region)));
+        g_key_file_set_uint64(context->key_file, group, address_key,
+                              io_region->addr);
+        g_key_file_set_uint64(context->key_file, group, size_key,
+                              io_region->size);
+        g_key_file_set_uint64(context->key_file, group, type_key,
+                              io_region->type);
+    }
+}
+
+static bool virt_hybrid_hibernate_pci_marker_add_all(
+    VirtMachineState *vms, GKeyFile *key_file, Error **errp)
+{
+    VirtHybridPCIMarkerContext context = {
+        .vms = vms,
+        .key_file = key_file,
+        .errp = errp,
+    };
+
+    if (!QLIST_EMPTY(&vms->bus->child)) {
+        error_setg(errp, "hybrid hibernation does not support PCI bridges");
+        return false;
+    }
+    pci_for_each_device_under_bus(vms->bus,
+                                  virt_hybrid_hibernate_pci_marker_add,
+                                  &context);
+    if (*errp) {
+        return false;
+    }
+    if (!context.count) {
+        error_setg(errp, "cannot hibernate without PCI device state");
+        return false;
+    }
+
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_GROUP,
+                          "pci-device-count", context.count);
+    return true;
+}
+
 static bool virt_hybrid_hibernate_marker_write(VirtMachineState *vms,
                                                 Error **errp)
 {
@@ -257,11 +512,19 @@ static bool virt_hybrid_hibernate_marker_write(VirtMachineState *vms,
                           vms->hybrid_hibernate_rx_pa);
     g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_GROUP, "page-count",
                           vms->hybrid_hibernate_page_count);
+    if (!virt_hybrid_hibernate_pci_marker_add_all(vms, key_file, errp)) {
+        return false;
+    }
     contents = g_key_file_to_data(key_file, &length, &gerr);
     if (!contents) {
         error_setg(errp, "cannot format hybrid hibernation marker '%s': %s",
                    vms->hybrid_hibernate_state_file, gerr->message);
         g_error_free(gerr);
+        return false;
+    }
+    if (length > HYBRID_HIBERNATE_MARKER_MAX_SIZE) {
+        error_setg(errp, "hybrid hibernation marker '%s' is too large",
+                   vms->hybrid_hibernate_state_file);
         return false;
     }
 
@@ -343,6 +606,144 @@ static bool virt_hybrid_hibernate_marker_remove(VirtMachineState *vms,
     }
 
     return virt_hybrid_hibernate_marker_sync_directory(vms, errp);
+}
+
+static void virt_hybrid_hibernate_pci_count(PCIBus *bus, PCIDevice *dev,
+                                             void *opaque)
+{
+    unsigned int *count = opaque;
+
+    (*count)++;
+}
+
+static PCIDevice *virt_hybrid_hibernate_pci_find(
+    VirtMachineState *vms, const VirtHybridPCIDeviceState *state)
+{
+    return pci_find_device(vms->bus, PCI_BUS_NUM(state->bdf),
+                           state->bdf & 0xff);
+}
+
+static bool virt_hybrid_hibernate_pci_validate(VirtMachineState *vms,
+                                                Error **errp)
+{
+    unsigned int count = 0;
+    unsigned int i;
+
+    if (!vms->hybrid_hibernate_pci_states->len) {
+        error_setg(errp, "hybrid hibernation marker has no PCI state");
+        return false;
+    }
+    if (!QLIST_EMPTY(&vms->bus->child)) {
+        error_setg(errp, "hybrid hibernation PCI topology has bridges "
+                   "after reset");
+        return false;
+    }
+    pci_for_each_device_under_bus(vms->bus,
+                                  virt_hybrid_hibernate_pci_count, &count);
+    if (count != vms->hybrid_hibernate_pci_states->len) {
+        error_setg(errp, "hybrid hibernation PCI device count changed "
+                   "from %u to %u",
+                   vms->hybrid_hibernate_pci_states->len, count);
+        return false;
+    }
+
+    for (i = 0; i < count; i++) {
+        VirtHybridPCIDeviceState *state =
+            g_ptr_array_index(vms->hybrid_hibernate_pci_states, i);
+        PCIDevice *dev = virt_hybrid_hibernate_pci_find(vms, state);
+        unsigned int region;
+
+        if (!dev || IS_PCI_BRIDGE(dev) || pci_is_vf(dev) ||
+            strcmp(object_get_typename(OBJECT(dev)), state->qom_type) ||
+            pci_get_word(dev->config + PCI_VENDOR_ID) != state->vendor_id ||
+            pci_get_word(dev->config + PCI_DEVICE_ID) != state->device_id ||
+            pci_get_long(dev->config + PCI_CLASS_REVISION) !=
+                state->class_revision ||
+            pci_get_byte(dev->config + PCI_HEADER_TYPE) !=
+                state->header_type) {
+            error_setg(errp, "hybrid hibernation PCI device 0x%x does not "
+                       "match the saved topology", state->bdf);
+            return false;
+        }
+
+        for (region = 0; region < PCI_NUM_REGIONS; region++) {
+            PCIIORegion *io_region = &dev->io_regions[region];
+            uint64_t address = state->region_address[region];
+            uint64_t size = state->region_size[region];
+
+            if (io_region->size != size ||
+                io_region->type != state->region_type[region] ||
+                (size && address != PCI_BAR_UNMAPPED &&
+                 ((address & (size - 1)) || address + size < address))) {
+                error_setg(errp, "hybrid hibernation PCI region %u for "
+                           "device 0x%x is invalid", region, state->bdf);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool virt_hybrid_hibernate_pci_restore(VirtMachineState *vms,
+                                               Error **errp)
+{
+    unsigned int i;
+
+    if (!virt_hybrid_hibernate_pci_validate(vms, errp)) {
+        return false;
+    }
+
+    for (i = 0; i < vms->hybrid_hibernate_pci_states->len; i++) {
+        VirtHybridPCIDeviceState *state =
+            g_ptr_array_index(vms->hybrid_hibernate_pci_states, i);
+        PCIDevice *dev = virt_hybrid_hibernate_pci_find(vms, state);
+
+        pci_host_config_write_common(dev, PCI_COMMAND,
+                                     pci_config_size(dev), 0, 2);
+    }
+
+    for (i = 0; i < vms->hybrid_hibernate_pci_states->len; i++) {
+        VirtHybridPCIDeviceState *state =
+            g_ptr_array_index(vms->hybrid_hibernate_pci_states, i);
+        PCIDevice *dev = virt_hybrid_hibernate_pci_find(vms, state);
+        unsigned int region;
+
+        for (region = 0; region < PCI_NUM_REGIONS; region++) {
+            pci_host_config_write_common(dev, pci_bar(dev, region),
+                                         pci_config_size(dev),
+                                         state->bar[region], 4);
+        }
+    }
+
+    for (i = 0; i < vms->hybrid_hibernate_pci_states->len; i++) {
+        VirtHybridPCIDeviceState *state =
+            g_ptr_array_index(vms->hybrid_hibernate_pci_states, i);
+        PCIDevice *dev = virt_hybrid_hibernate_pci_find(vms, state);
+        uint16_t command = state->command & ~PCI_COMMAND_MASTER;
+        unsigned int region;
+
+        pci_host_config_write_common(dev, PCI_COMMAND,
+                                     pci_config_size(dev), command, 2);
+        if (pci_get_word(dev->config + PCI_COMMAND) != command) {
+            error_setg(errp, "cannot restore PCI command for hybrid "
+                       "hibernation device 0x%x", state->bdf);
+            return false;
+        }
+        for (region = 0; region < PCI_NUM_REGIONS; region++) {
+            PCIIORegion *io_region = &dev->io_regions[region];
+
+            if (pci_get_long(dev->config + pci_bar(dev, region)) !=
+                    state->bar[region] ||
+                io_region->addr != state->region_address[region]) {
+                error_setg(errp, "cannot restore PCI region %u for hybrid "
+                           "hibernation device 0x%x", region, state->bdf);
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 /*
@@ -2925,6 +3326,7 @@ static int virt_hybrid_resume_hibernate(VirtMachineState *vms,
         vms->hybrid_hibernate_marker_pending = false;
         ARM_GICV3_COMMON(vms->gic)->hibernate_resume_pending = false;
         ARM_GICV3_ITS_COMMON(vms->its)->hibernate_resume_pending = false;
+        g_ptr_array_set_size(vms->hybrid_hibernate_pci_states, 0);
         virt_hybrid_record_rxtx_map(vms, tx_pa, rx_pa, page_count);
         resume_all_primary_vcpus();
     }
@@ -3122,11 +3524,14 @@ int arm_hybrid_system_off(bool require_hibernate)
     if (!vms->hybrid_hibernate_prepared ||
         !vms->hybrid_hibernate_state_file) {
         ret = require_hibernate ? -ENOTSUP : 0;
-    } else if (!virt_hybrid_hibernate_marker_write(vms, &err)) {
-        error_reportf_err(err, "mach-virt: cannot commit hibernation: ");
-        ret = -EIO;
     } else {
-        vms->hybrid_hibernate_prepared = false;
+        pause_all_primary_vcpus();
+        if (!virt_hybrid_hibernate_marker_write(vms, &err)) {
+            error_reportf_err(err, "mach-virt: cannot commit hibernation: ");
+            ret = -EIO;
+        } else {
+            vms->hybrid_hibernate_prepared = false;
+        }
     }
     bql_unlock();
     return ret;
@@ -3259,6 +3664,9 @@ static void virt_machine_reset(MachineState *machine, ResetType type)
     }
 
     qemu_devices_reset(type);
+    if (vms->hybrid_hibernate_marker_pending) {
+        virt_hybrid_hibernate_pci_restore(vms, &error_fatal);
+    }
 
     if (reboot) {
         cpu_reset(vms->hybrid_shadow_cpu);
@@ -3916,6 +4324,9 @@ static void machvirt_init(MachineState *machine)
         exit(1);
     }
     virt_hybrid_hibernate_marker_load(vms, &error_fatal);
+    if (vms->hybrid_hibernate_state_file) {
+        vms->pci_preserve_config = true;
+    }
 
     if (vms->hybrid_secure) {
         if (!kvm_enabled()) {
@@ -5753,6 +6164,8 @@ static void virt_instance_init(Object *obj)
     cxl_machine_init(obj, &vms->cxl_devices_state);
 
     vms->smmuv3_devices = g_ptr_array_new_with_free_func(NULL);
+    vms->hybrid_hibernate_pci_states = g_ptr_array_new_with_free_func(
+        virt_hybrid_hibernate_pci_state_free);
 }
 
 static void virt_instance_finalize(Object *obj)
@@ -5780,6 +6193,7 @@ static void virt_instance_finalize(Object *obj)
     g_free(vms->oem_id);
     g_free(vms->oem_table_id);
     g_free(vms->hybrid_hibernate_state_file);
+    g_ptr_array_unref(vms->hybrid_hibernate_pci_states);
 }
 
 static const TypeInfo virt_machine_info = {
