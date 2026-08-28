@@ -56,6 +56,8 @@
 
 #define CPU_MAX_CACHES 16
 
+typedef struct GICv3ITSHibernateState GICv3ITSHibernateState;
+
 enum {
     VIRT_FLASH,
     VIRT_MEM,
@@ -182,20 +184,11 @@ struct VirtMachineState {
     bool hybrid_runtime_inflight;
     bool hybrid_runtime_cancel_requested;
     bool hybrid_hibernate_marker_pending;
-    bool hybrid_hibernate_prepared;
-    bool hybrid_ffa_rxtx_valid;
     unsigned int hybrid_shadow_stage;
-    unsigned int hybrid_ffa_rxtx_map_count;
     uint32_t hybrid_secure_call_timeout_ms;
     uint64_t hybrid_shadow_smoke_x0;
     uint64_t hybrid_shadow_stop_pc;
     uint64_t hybrid_runtime_regs[18];
-    uint64_t hybrid_ffa_tx_pa;
-    uint64_t hybrid_ffa_rx_pa;
-    uint64_t hybrid_ffa_page_count;
-    uint64_t hybrid_hibernate_tx_pa;
-    uint64_t hybrid_hibernate_rx_pa;
-    uint64_t hybrid_hibernate_page_count;
     uint64_t hybrid_trampoline_addr;
     int hybrid_runtime_result;
     uint64_t hybrid_bl33_xregs[31];
@@ -253,6 +246,16 @@ struct VirtMachineState {
     bool legacy_smmuv3_present;
     Error *hybrid_migration_blocker;
     char *hybrid_hibernate_state_file;
+    char *hybrid_hibernate_machine_type;
+    char *hybrid_hibernate_cpu_type;
+    char *hybrid_hibernate_gic_type;
+    char *hybrid_hibernate_its_type;
+    uint64_t hybrid_hibernate_ram_size;
+    uint64_t hybrid_hibernate_gic_dist_base;
+    uint64_t hybrid_hibernate_gic_redist_base;
+    uint64_t hybrid_hibernate_its_base;
+    uint32_t hybrid_hibernate_cpu_count;
+    GICv3ITSHibernateState *hybrid_hibernate_its_state;
     GPtrArray *hybrid_hibernate_pci_states;
     MemoryRegion *hybrid_smc_trampoline;
     MemoryRegion *sysmem;

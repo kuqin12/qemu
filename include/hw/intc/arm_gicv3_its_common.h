@@ -54,6 +54,22 @@ typedef struct {
     uint64_t base_addr;
 } CmdQDesc;
 
+typedef struct GICv3ITSHibernateBlob {
+    uint64_t guest_address;
+    GBytes *data;
+} GICv3ITSHibernateBlob;
+
+typedef struct GICv3ITSHibernateState {
+    uint64_t ctlr;
+    uint64_t iidr;
+    uint64_t typer;
+    uint64_t cbaser;
+    uint64_t cwriter;
+    uint64_t creadr;
+    uint64_t baser[8];
+    GPtrArray *blobs;
+} GICv3ITSHibernateState;
+
 struct GICv3ITSState {
     SysBusDevice parent_obj;
 
@@ -122,13 +138,24 @@ struct GICv3ITSCommonClass {
     void (*pre_save)(GICv3ITSState *s);
     void (*post_load)(GICv3ITSState *s);
     int (*validate_hibernate)(GICv3ITSState *s, Error **errp);
-    int (*prepare_hibernate)(GICv3ITSState *s, Error **errp);
-    int (*resume_hibernate)(GICv3ITSState *s, Error **errp);
+    int (*capture_hibernate)(GICv3ITSState *s,
+                             GICv3ITSHibernateState *state,
+                             Error **errp);
+    int (*restore_hibernate)(GICv3ITSState *s,
+                             const GICv3ITSHibernateState *state,
+                             Error **errp);
 };
 
 int gicv3_its_validate_hibernate(DeviceState *dev, Error **errp);
-int gicv3_its_prepare_hibernate(DeviceState *dev, Error **errp);
-int gicv3_its_resume_hibernate(DeviceState *dev, Error **errp);
+#define GICV3_ITS_HIBERNATE_NOT_READY 1
+GICv3ITSHibernateState *gicv3_its_hibernate_state_new(void);
+void gicv3_its_hibernate_state_free(GICv3ITSHibernateState *state);
+int gicv3_its_capture_hibernate(DeviceState *dev,
+                                GICv3ITSHibernateState *state,
+                                Error **errp);
+int gicv3_its_restore_hibernate(DeviceState *dev,
+                                const GICv3ITSHibernateState *state,
+                                Error **errp);
 
 /**
  * its_class_name:

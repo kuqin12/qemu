@@ -122,15 +122,14 @@ enum {
 #define HYBRID_SECURE_CALL_TIMEOUT_MS 5000
 #define HYBRID_SECURE_CANCEL_TIMEOUT_MS 1000
 #define HYBRID_HIBERNATE_GROUP "qemu-arm-hybrid-s4"
+#define HYBRID_HIBERNATE_ITS_GROUP "its-state"
+#define HYBRID_HIBERNATE_ITS_BLOB_GROUP "its-blob-%u"
 #define HYBRID_HIBERNATE_PCI_GROUP "pci-device-%u"
-#define HYBRID_HIBERNATE_VERSION 3
-#define HYBRID_HIBERNATE_MARKER_MAX_SIZE MiB
+#define HYBRID_HIBERNATE_VERSION 4
+#define HYBRID_HIBERNATE_MARKER_MAX_SIZE (48 * MiB)
+#define HYBRID_HIBERNATE_ITS_MAX_BYTES (32 * MiB)
+#define HYBRID_HIBERNATE_ITS_MAX_BLOBS 512
 #define HYBRID_HIBERNATE_PCI_DEVICE_MAX 256
-#define HYBRID_FFA_PAGE_SIZE 4096
-#define HYBRID_FFA_SUCCESS 0x84000061U
-#define HYBRID_FFA_RXTX_MAP_32 0x84000066U
-#define HYBRID_FFA_RXTX_MAP_64 0xc4000066U
-#define HYBRID_FFA_RXTX_UNMAP 0x84000067U
 
 typedef struct VirtHybridPCIDeviceState {
     char *qom_type;
@@ -194,6 +193,162 @@ static bool virt_hybrid_hibernate_marker_get_bounded_uint64(
                    "out of range", group, key);
         return false;
     }
+    return true;
+}
+
+static bool virt_hybrid_hibernate_its_state_load(
+    VirtMachineState *vms, GKeyFile *key_file, Error **errp)
+{
+    GICv3ITSHibernateState *state = vms->hybrid_hibernate_its_state;
+    uint64_t blob_count;
+    uint64_t total = 0;
+    uint64_t value;
+    unsigned int i;
+
+    g_ptr_array_set_size(state->blobs, 0);
+#define LOAD_ITS_FIELD(_key, _field)                                   \
+    do {                                                               \
+        if (!virt_hybrid_hibernate_marker_get_uint64(                  \
+                key_file, HYBRID_HIBERNATE_ITS_GROUP, (_key),          \
+                &value, errp)) {                                       \
+            return false;                                              \
+        }                                                              \
+        state->_field = value;                                         \
+    } while (0)
+
+    LOAD_ITS_FIELD("ctlr", ctlr);
+    LOAD_ITS_FIELD("iidr", iidr);
+    LOAD_ITS_FIELD("typer", typer);
+    LOAD_ITS_FIELD("cbaser", cbaser);
+    LOAD_ITS_FIELD("cwriter", cwriter);
+    LOAD_ITS_FIELD("creadr", creadr);
+    for (i = 0; i < ARRAY_SIZE(state->baser); i++) {
+        g_autofree char *key = g_strdup_printf("baser-%u", i);
+
+        LOAD_ITS_FIELD(key, baser[i]);
+    }
+#undef LOAD_ITS_FIELD
+
+    if (!virt_hybrid_hibernate_marker_get_bounded_uint64(
+            key_file, HYBRID_HIBERNATE_ITS_GROUP, "blob-count",
+            HYBRID_HIBERNATE_ITS_MAX_BLOBS, &blob_count, errp) ||
+        !blob_count) {
+        if (!*errp) {
+            error_setg(errp, "hybrid hibernation marker has no ITS blobs");
+        }
+        return false;
+    }
+
+    for (i = 0; i < blob_count; i++) {
+        g_autofree char *group =
+            g_strdup_printf(HYBRID_HIBERNATE_ITS_BLOB_GROUP, i);
+        g_autofree char *encoded = NULL;
+        g_autofree uint8_t *decoded = NULL;
+        g_autofree char *canonical = NULL;
+        g_autoptr(GError) gerr = NULL;
+        GICv3ITSHibernateBlob *blob;
+        gsize decoded_size;
+        uint64_t guest_address;
+        uint64_t expected_size;
+        unsigned int previous_index;
+
+        if (!virt_hybrid_hibernate_marker_get_uint64(
+                key_file, group, "guest-address", &guest_address, errp) ||
+            !virt_hybrid_hibernate_marker_get_bounded_uint64(
+                key_file, group, "size", HYBRID_HIBERNATE_ITS_MAX_BYTES,
+                &expected_size, errp) || !expected_size ||
+            guest_address + expected_size < guest_address ||
+            total > HYBRID_HIBERNATE_ITS_MAX_BYTES - expected_size) {
+            if (!*errp) {
+                error_setg(errp, "invalid hybrid hibernation ITS blob "
+                           "[%s]", group);
+            }
+            return false;
+        }
+
+        encoded = g_key_file_get_string(key_file, group, "data", &gerr);
+        if (gerr) {
+            error_setg(errp, "invalid hybrid hibernation ITS blob [%s]: %s",
+                       group, gerr->message);
+            return false;
+        }
+        decoded = g_base64_decode(encoded, &decoded_size);
+        canonical = g_base64_encode(decoded, decoded_size);
+        if (decoded_size != expected_size || strcmp(encoded, canonical)) {
+            error_setg(errp, "hybrid hibernation ITS blob [%s] has invalid "
+                       "base64 data", group);
+            return false;
+        }
+
+        for (previous_index = 0; previous_index < state->blobs->len;
+             previous_index++) {
+            GICv3ITSHibernateBlob *previous =
+                g_ptr_array_index(state->blobs, previous_index);
+            uint64_t previous_size = g_bytes_get_size(previous->data);
+
+            if (ranges_overlap(previous->guest_address, previous_size,
+                               guest_address, expected_size)) {
+                error_setg(errp, "hybrid hibernation ITS blobs overlap");
+                return false;
+            }
+        }
+
+        blob = g_new0(GICv3ITSHibernateBlob, 1);
+        blob->guest_address = guest_address;
+        blob->data = g_bytes_new_take(g_steal_pointer(&decoded),
+                                      decoded_size);
+        g_ptr_array_add(state->blobs, blob);
+        total += expected_size;
+    }
+
+    return true;
+}
+
+static bool virt_hybrid_hibernate_config_load(
+    VirtMachineState *vms, GKeyFile *key_file, Error **errp)
+{
+    g_autoptr(GError) gerr = NULL;
+    uint64_t value;
+
+#define LOAD_CONFIG_STRING(_key, _field)                               \
+    do {                                                               \
+        g_free(vms->_field);                                           \
+        vms->_field = g_key_file_get_string(                           \
+            key_file, HYBRID_HIBERNATE_GROUP, (_key), &gerr);          \
+        if (gerr || !vms->_field || !vms->_field[0]) {                 \
+            error_setg(errp, "invalid hybrid hibernation %s: %s",     \
+                       (_key), gerr ? gerr->message : "empty value");  \
+            return false;                                              \
+        }                                                              \
+    } while (0)
+
+    LOAD_CONFIG_STRING("machine-type", hybrid_hibernate_machine_type);
+    LOAD_CONFIG_STRING("cpu-type", hybrid_hibernate_cpu_type);
+    LOAD_CONFIG_STRING("gic-type", hybrid_hibernate_gic_type);
+    LOAD_CONFIG_STRING("its-type", hybrid_hibernate_its_type);
+#undef LOAD_CONFIG_STRING
+
+#define LOAD_CONFIG_FIELD(_key, _maximum, _field)                      \
+    do {                                                               \
+        if (!virt_hybrid_hibernate_marker_get_bounded_uint64(          \
+                key_file, HYBRID_HIBERNATE_GROUP, (_key), (_maximum),  \
+                &value, errp)) {                                       \
+            return false;                                              \
+        }                                                              \
+        vms->_field = value;                                           \
+    } while (0)
+
+    LOAD_CONFIG_FIELD("ram-size", UINT64_MAX, hybrid_hibernate_ram_size);
+    LOAD_CONFIG_FIELD("cpu-count", UINT32_MAX,
+                      hybrid_hibernate_cpu_count);
+    LOAD_CONFIG_FIELD("gic-dist-base", UINT64_MAX,
+                      hybrid_hibernate_gic_dist_base);
+    LOAD_CONFIG_FIELD("gic-redist-base", UINT64_MAX,
+                      hybrid_hibernate_gic_redist_base);
+    LOAD_CONFIG_FIELD("its-base", UINT64_MAX,
+                      hybrid_hibernate_its_base);
+#undef LOAD_CONFIG_FIELD
+
     return true;
 }
 
@@ -289,16 +444,6 @@ static bool virt_hybrid_hibernate_pci_state_load(
     return true;
 }
 
-static bool virt_hybrid_hibernate_tuple_valid(uint64_t tx_pa,
-                                               uint64_t rx_pa,
-                                               uint64_t page_count)
-{
-    return tx_pa && rx_pa && tx_pa != rx_pa && page_count &&
-           page_count <= UINT32_MAX &&
-           !(tx_pa & (HYBRID_FFA_PAGE_SIZE - 1)) &&
-           !(rx_pa & (HYBRID_FFA_PAGE_SIZE - 1));
-}
-
 static bool virt_hybrid_hibernate_marker_load(VirtMachineState *vms,
                                                Error **errp)
 {
@@ -344,23 +489,8 @@ static bool virt_hybrid_hibernate_marker_load(VirtMachineState *vms,
         g_clear_error(&gerr);
         return false;
     }
-    vms->hybrid_hibernate_tx_pa = g_key_file_get_uint64(
-        key_file, HYBRID_HIBERNATE_GROUP, "tx-pa", &gerr);
-    if (!gerr) {
-        vms->hybrid_hibernate_rx_pa = g_key_file_get_uint64(
-            key_file, HYBRID_HIBERNATE_GROUP, "rx-pa", &gerr);
-    }
-    if (!gerr) {
-        vms->hybrid_hibernate_page_count = g_key_file_get_uint64(
-            key_file, HYBRID_HIBERNATE_GROUP, "page-count", &gerr);
-    }
-    if (gerr || !virt_hybrid_hibernate_tuple_valid(
-            vms->hybrid_hibernate_tx_pa,
-            vms->hybrid_hibernate_rx_pa,
-            vms->hybrid_hibernate_page_count)) {
-        error_setg(errp, "invalid hybrid hibernation marker '%s'",
-                   vms->hybrid_hibernate_state_file);
-        g_clear_error(&gerr);
+    if (!virt_hybrid_hibernate_config_load(vms, key_file, errp) ||
+        !virt_hybrid_hibernate_its_state_load(vms, key_file, errp)) {
         return false;
     }
     if (!virt_hybrid_hibernate_pci_state_load(vms, key_file, errp)) {
@@ -493,25 +623,84 @@ static bool virt_hybrid_hibernate_pci_marker_add_all(
     return true;
 }
 
+static void virt_hybrid_hibernate_its_marker_add(
+    GKeyFile *key_file, const GICv3ITSHibernateState *state)
+{
+    unsigned int i;
+
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_ITS_GROUP, "ctlr",
+                          state->ctlr);
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_ITS_GROUP, "iidr",
+                          state->iidr);
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_ITS_GROUP, "typer",
+                          state->typer);
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_ITS_GROUP, "cbaser",
+                          state->cbaser);
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_ITS_GROUP, "cwriter",
+                          state->cwriter);
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_ITS_GROUP, "creadr",
+                          state->creadr);
+    for (i = 0; i < ARRAY_SIZE(state->baser); i++) {
+        g_autofree char *key = g_strdup_printf("baser-%u", i);
+
+        g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_ITS_GROUP, key,
+                              state->baser[i]);
+    }
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_ITS_GROUP,
+                          "blob-count", state->blobs->len);
+
+    for (i = 0; i < state->blobs->len; i++) {
+        GICv3ITSHibernateBlob *blob = g_ptr_array_index(state->blobs, i);
+        g_autofree char *group =
+            g_strdup_printf(HYBRID_HIBERNATE_ITS_BLOB_GROUP, i);
+        g_autofree char *encoded = NULL;
+        gsize size;
+        const void *data = g_bytes_get_data(blob->data, &size);
+
+        encoded = g_base64_encode(data, size);
+        g_key_file_set_uint64(key_file, group, "guest-address",
+                              blob->guest_address);
+        g_key_file_set_uint64(key_file, group, "size", size);
+        g_key_file_set_string(key_file, group, "data", encoded);
+    }
+}
+
 static bool virt_hybrid_hibernate_marker_write(VirtMachineState *vms,
                                                 Error **errp)
 {
     g_autoptr(GKeyFile) key_file = g_key_file_new();
     g_autofree char *contents = NULL;
+    g_autofree char *existing = NULL;
     g_autofree char *temp_path = NULL;
     GError *gerr = NULL;
     bool renamed = false;
+    gsize existing_length = 0;
     gsize length;
     int fd;
 
     g_key_file_set_integer(key_file, HYBRID_HIBERNATE_GROUP, "version",
                            HYBRID_HIBERNATE_VERSION);
-    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_GROUP, "tx-pa",
-                          vms->hybrid_hibernate_tx_pa);
-    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_GROUP, "rx-pa",
-                          vms->hybrid_hibernate_rx_pa);
-    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_GROUP, "page-count",
-                          vms->hybrid_hibernate_page_count);
+    g_key_file_set_string(key_file, HYBRID_HIBERNATE_GROUP, "machine-type",
+                          object_get_typename(OBJECT(vms)));
+    g_key_file_set_string(key_file, HYBRID_HIBERNATE_GROUP, "cpu-type",
+                          MACHINE(vms)->cpu_type);
+    g_key_file_set_string(key_file, HYBRID_HIBERNATE_GROUP, "gic-type",
+                          object_get_typename(OBJECT(vms->gic)));
+    g_key_file_set_string(key_file, HYBRID_HIBERNATE_GROUP, "its-type",
+                          object_get_typename(OBJECT(vms->its)));
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_GROUP, "ram-size",
+                          MACHINE(vms)->ram_size);
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_GROUP, "cpu-count",
+                          MACHINE(vms)->smp.cpus);
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_GROUP, "gic-dist-base",
+                          vms->memmap[VIRT_GIC_DIST].base);
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_GROUP,
+                          "gic-redist-base",
+                          vms->memmap[VIRT_GIC_REDIST].base);
+    g_key_file_set_uint64(key_file, HYBRID_HIBERNATE_GROUP, "its-base",
+                          vms->memmap[VIRT_GIC_ITS].base);
+    virt_hybrid_hibernate_its_marker_add(
+        key_file, vms->hybrid_hibernate_its_state);
     if (!virt_hybrid_hibernate_pci_marker_add_all(vms, key_file, errp)) {
         return false;
     }
@@ -528,11 +717,18 @@ static bool virt_hybrid_hibernate_marker_write(VirtMachineState *vms,
         return false;
     }
 
-    if (g_file_test(vms->hybrid_hibernate_state_file,
-                    G_FILE_TEST_EXISTS)) {
-        error_setg(errp, "hybrid hibernation marker '%s' already exists",
-                   vms->hybrid_hibernate_state_file);
+    if (g_file_get_contents(vms->hybrid_hibernate_state_file, &existing,
+                            &existing_length, &gerr)) {
+        if (existing_length == length && !memcmp(existing, contents, length)) {
+            return true;
+        }
+    } else if (!g_error_matches(gerr, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+        error_setg(errp, "cannot compare hybrid hibernation marker '%s': %s",
+                   vms->hybrid_hibernate_state_file, gerr->message);
+        g_error_free(gerr);
         return false;
+    } else {
+        g_clear_error(&gerr);
     }
 
     temp_path = g_strdup_printf("%s.XXXXXX",
@@ -566,12 +762,6 @@ static bool virt_hybrid_hibernate_marker_write(VirtMachineState *vms,
         goto fail;
     }
     fd = -1;
-    if (g_file_test(vms->hybrid_hibernate_state_file,
-                    G_FILE_TEST_EXISTS)) {
-        error_setg(errp, "hybrid hibernation marker '%s' already exists",
-                   vms->hybrid_hibernate_state_file);
-        goto fail;
-    }
     if (g_rename(temp_path, vms->hybrid_hibernate_state_file)) {
         error_setg_errno(errp, errno,
                          "cannot publish hybrid hibernation marker '%s'",
@@ -606,6 +796,60 @@ static bool virt_hybrid_hibernate_marker_remove(VirtMachineState *vms,
     }
 
     return virt_hybrid_hibernate_marker_sync_directory(vms, errp);
+}
+
+static bool virt_hybrid_hibernate_config_validate(VirtMachineState *vms,
+                                                   Error **errp)
+{
+    MachineState *machine = MACHINE(vms);
+
+#define VALIDATE_CONFIG_STRING(_description, _saved, _current)         \
+    do {                                                               \
+        if (strcmp((_saved), (_current))) {                            \
+            error_setg(errp, "hybrid hibernation %s changed from "    \
+                       "'%s' to '%s'", (_description), (_saved),       \
+                       (_current));                                    \
+            return false;                                              \
+        }                                                              \
+    } while (0)
+
+    VALIDATE_CONFIG_STRING("machine type",
+                           vms->hybrid_hibernate_machine_type,
+                           object_get_typename(OBJECT(vms)));
+    VALIDATE_CONFIG_STRING("CPU type", vms->hybrid_hibernate_cpu_type,
+                           machine->cpu_type);
+    VALIDATE_CONFIG_STRING("GIC type", vms->hybrid_hibernate_gic_type,
+                           object_get_typename(OBJECT(vms->gic)));
+    VALIDATE_CONFIG_STRING("ITS type", vms->hybrid_hibernate_its_type,
+                           object_get_typename(OBJECT(vms->its)));
+#undef VALIDATE_CONFIG_STRING
+
+#define VALIDATE_CONFIG_VALUE(_description, _saved, _current)          \
+    do {                                                               \
+        if ((_saved) != (_current)) {                                  \
+            error_setg(errp, "hybrid hibernation %s changed from "    \
+                       "0x%" PRIx64 " to 0x%" PRIx64,                 \
+                       (_description), (uint64_t)(_saved),              \
+                       (uint64_t)(_current));                           \
+            return false;                                              \
+        }                                                              \
+    } while (0)
+
+    VALIDATE_CONFIG_VALUE("RAM size", vms->hybrid_hibernate_ram_size,
+                          machine->ram_size);
+    VALIDATE_CONFIG_VALUE("CPU count", vms->hybrid_hibernate_cpu_count,
+                          machine->smp.cpus);
+    VALIDATE_CONFIG_VALUE("GIC distributor base",
+                          vms->hybrid_hibernate_gic_dist_base,
+                          vms->memmap[VIRT_GIC_DIST].base);
+    VALIDATE_CONFIG_VALUE("GIC redistributor base",
+                          vms->hybrid_hibernate_gic_redist_base,
+                          vms->memmap[VIRT_GIC_REDIST].base);
+    VALIDATE_CONFIG_VALUE("ITS base", vms->hybrid_hibernate_its_base,
+                          vms->memmap[VIRT_GIC_ITS].base);
+#undef VALIDATE_CONFIG_VALUE
+
+    return true;
 }
 
 static void virt_hybrid_hibernate_pci_count(PCIBus *bus, PCIDevice *dev,
@@ -3230,169 +3474,50 @@ static void virt_hybrid_shadow_run_worker(VirtMachineState *vms)
     bql_lock();
 }
 
-static bool virt_hybrid_hibernate_tuple_matches(VirtMachineState *vms,
-                                                 uint64_t tx_pa,
-                                                 uint64_t rx_pa,
-                                                 uint64_t page_count)
+int arm_hybrid_restore_its(DeviceState *its, Error **errp)
 {
-    return tx_pa == vms->hybrid_hibernate_tx_pa &&
-           rx_pa == vms->hybrid_hibernate_rx_pa &&
-           page_count == vms->hybrid_hibernate_page_count;
-}
-
-static void virt_hybrid_record_rxtx_map(VirtMachineState *vms,
-                                        uint64_t tx_pa, uint64_t rx_pa,
-                                        uint64_t page_count)
-{
-    vms->hybrid_ffa_tx_pa = tx_pa;
-    vms->hybrid_ffa_rx_pa = rx_pa;
-    vms->hybrid_ffa_page_count = page_count;
-    vms->hybrid_ffa_rxtx_valid = true;
-    vms->hybrid_ffa_rxtx_map_count += 1;
-}
-
-static int virt_hybrid_prepare_hibernate(VirtMachineState *vms, Error **errp)
-{
+    VirtMachineState *vms;
     int ret;
 
-    if (!vms->hybrid_ffa_rxtx_valid) {
-        error_setg(errp, "cannot prepare hibernation without a mapped "
-                   "FF-A RX/TX buffer");
-        return -EINVAL;
+    if (!current_machine ||
+        !object_dynamic_cast(OBJECT(current_machine), TYPE_VIRT_MACHINE)) {
+        return 0;
     }
-    if (!vms->its) {
-        error_setg(errp, "cannot prepare hibernation without an ITS");
-        return -ENODEV;
+
+    vms = VIRT_MACHINE(current_machine);
+    if (!vms->hybrid_hibernate_marker_pending || its != vms->its) {
+        return 0;
     }
 
     pause_all_primary_vcpus();
-    ret = gicv3_prepare_hibernate(vms->gic, errp);
-    if (!ret) {
-        ret = gicv3_its_prepare_hibernate(vms->its, errp);
-    }
-    if (!ret) {
-        vms->hybrid_hibernate_tx_pa = vms->hybrid_ffa_tx_pa;
-        vms->hybrid_hibernate_rx_pa = vms->hybrid_ffa_rx_pa;
-        vms->hybrid_hibernate_page_count =
-            vms->hybrid_ffa_page_count;
-        vms->hybrid_hibernate_prepared = true;
+    ret = gicv3_its_restore_hibernate(
+        its, vms->hybrid_hibernate_its_state, errp);
+    if (ret == GICV3_ITS_HIBERNATE_NOT_READY) {
         resume_all_primary_vcpus();
-    }
-
-    return ret;
-}
-
-static int virt_hybrid_resume_hibernate(VirtMachineState *vms,
-                                         uint64_t tx_pa, uint64_t rx_pa,
-                                         uint64_t page_count, Error **errp)
-{
-    int ret;
-
-    if (!virt_hybrid_hibernate_tuple_valid(tx_pa, rx_pa, page_count)) {
-        error_setg(errp, "invalid FF-A RX/TX buffer mapping");
-        return -EINVAL;
-    }
-
-    if (vms->hybrid_hibernate_prepared) {
-        vms->hybrid_hibernate_prepared = false;
-        virt_hybrid_record_rxtx_map(vms, tx_pa, rx_pa, page_count);
         return 0;
     }
-    if (!vms->hybrid_hibernate_marker_pending) {
-        virt_hybrid_record_rxtx_map(vms, tx_pa, rx_pa, page_count);
-        return 0;
-    }
-    if (!virt_hybrid_hibernate_tuple_matches(vms, tx_pa, rx_pa,
-                                              page_count)) {
-        if (vms->hybrid_ffa_rxtx_map_count != 0) {
-            error_setg(errp, "restored Windows FF-A RX/TX buffer does not "
-                       "match the hibernation marker");
-            return -ESTALE;
-        }
-        virt_hybrid_record_rxtx_map(vms, tx_pa, rx_pa, page_count);
-        return 0;
-    }
-    if (!vms->its) {
-        error_setg(errp, "cannot resume hibernation without an ITS");
-        return -ENODEV;
-    }
-
-    pause_all_primary_vcpus();
-    ret = gicv3_its_resume_hibernate(vms->its, errp);
-    if (!ret && !virt_hybrid_hibernate_marker_remove(vms, errp)) {
-        ret = -EIO;
-    }
-    if (!ret) {
-        vms->hybrid_hibernate_marker_pending = false;
-        ARM_GICV3_COMMON(vms->gic)->hibernate_resume_pending = false;
-        ARM_GICV3_ITS_COMMON(vms->its)->hibernate_resume_pending = false;
-        g_ptr_array_set_size(vms->hybrid_hibernate_pci_states, 0);
-        virt_hybrid_record_rxtx_map(vms, tx_pa, rx_pa, page_count);
-        resume_all_primary_vcpus();
-    }
-
-    return ret;
-}
-
-static int virt_hybrid_hibernate_transition(VirtMachineState *vms,
-                                             uint64_t function_id,
-                                             uint64_t tx_pa,
-                                             uint64_t rx_pa,
-                                             uint64_t page_count,
-                                             Error **errp)
-{
-    int ret;
-
-    if (!vms->hybrid_hibernate_state_file) {
-        return 0;
-    }
-
-    switch (function_id) {
-    case HYBRID_FFA_RXTX_UNMAP:
-        if (vms->hybrid_hibernate_marker_pending) {
-            vms->hybrid_ffa_rxtx_valid = false;
-            return 0;
-        }
-        if (vms->hybrid_ffa_rxtx_map_count < 2) {
-            vms->hybrid_ffa_rxtx_valid = false;
-            return 0;
-        }
-        ret = virt_hybrid_prepare_hibernate(vms, errp);
-        if (!ret) {
-            vms->hybrid_ffa_rxtx_valid = false;
-        }
+    if (ret) {
         return ret;
-    case HYBRID_FFA_RXTX_MAP_32:
-    case HYBRID_FFA_RXTX_MAP_64:
-        return virt_hybrid_resume_hibernate(vms, tx_pa, rx_pa,
-                                             page_count, errp);
-    default:
-        return 0;
     }
+    if (!virt_hybrid_hibernate_marker_remove(vms, errp)) {
+        return -EIO;
+    }
+
+    vms->hybrid_hibernate_marker_pending = false;
+    ARM_GICV3_COMMON(vms->gic)->hibernate_resume_pending = false;
+    ARM_GICV3_ITS_COMMON(vms->its)->hibernate_resume_pending = false;
+    g_ptr_array_set_size(vms->hybrid_hibernate_its_state->blobs, 0);
+    g_ptr_array_set_size(vms->hybrid_hibernate_pci_states, 0);
+    resume_all_primary_vcpus();
+    return 1;
 }
 
 int arm_hybrid_ffa_call(uint64_t regs[18])
 {
     VirtMachineState *vms;
     uint64_t function_id = regs[0];
-    uint64_t tx_pa = regs[1];
-    uint64_t rx_pa = regs[2];
-    uint64_t page_count = regs[3];
-    Error *hibernate_err = NULL;
-    bool hibernate_transition;
     bool timed_out = false;
-    int hibernate_ret = 0;
     int ret;
-
-    if (function_id == HYBRID_FFA_RXTX_MAP_32) {
-        tx_pa = (uint32_t)tx_pa;
-        rx_pa = (uint32_t)rx_pa;
-        page_count = (uint32_t)page_count;
-    }
-
-    hibernate_transition = function_id == HYBRID_FFA_RXTX_UNMAP ||
-        function_id == HYBRID_FFA_RXTX_MAP_32 ||
-        function_id == HYBRID_FFA_RXTX_MAP_64;
 
     if (!current_machine ||
         !object_dynamic_cast(OBJECT(current_machine), TYPE_VIRT_MACHINE)) {
@@ -3479,29 +3604,11 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
     }
     qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
 
-    if (!ret && regs[0] == HYBRID_FFA_SUCCESS && hibernate_transition &&
-        vms->hybrid_hibernate_state_file) {
-        bql_lock();
-        hibernate_ret = virt_hybrid_hibernate_transition(vms, function_id,
-                                                          tx_pa, rx_pa,
-                                                          page_count,
-                                                          &hibernate_err);
-        if (hibernate_ret) {
-            error_reportf_err(hibernate_err,
-                              "mach-virt: hybrid hibernation transition "
-                              "failed: ");
-            vms->hybrid_shadow_cpu->stopped = true;
-            qemu_system_vmstop_request_prepare();
-            qemu_system_vmstop_request(RUN_STATE_INTERNAL_ERROR);
-        }
-        bql_unlock();
-    }
-
     qemu_mutex_lock(&vms->hybrid_shadow_mutex);
     vms->hybrid_runtime_inflight = false;
     qatomic_set(&vms->hybrid_runtime_cancel_requested, false);
     qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
-    return hibernate_ret ? hibernate_ret : ret;
+    return ret;
 }
 
 int arm_hybrid_system_off(bool require_hibernate)
@@ -3520,18 +3627,33 @@ int arm_hybrid_system_off(bool require_hibernate)
         return -ENOTSUP;
     }
 
+    if (!vms->hybrid_hibernate_state_file || !vms->its) {
+        return require_hibernate ? -ENOTSUP : 0;
+    }
+
     bql_lock();
-    if (!vms->hybrid_hibernate_prepared ||
-        !vms->hybrid_hibernate_state_file) {
-        ret = require_hibernate ? -ENOTSUP : 0;
-    } else {
-        pause_all_primary_vcpus();
-        if (!virt_hybrid_hibernate_marker_write(vms, &err)) {
-            error_reportf_err(err, "mach-virt: cannot commit hibernation: ");
-            ret = -EIO;
-        } else {
-            vms->hybrid_hibernate_prepared = false;
-        }
+    pause_all_primary_vcpus();
+    ret = gicv3_its_capture_hibernate(
+        vms->its, vms->hybrid_hibernate_its_state, &err);
+    if (ret == GICV3_ITS_HIBERNATE_NOT_READY) {
+        error_setg(&err, "ITS is not ready for hibernation capture");
+        ret = -EAGAIN;
+    }
+    if (!ret) {
+        ret = gicv3_prepare_hibernate(vms->gic, &err);
+    }
+    if (!ret && !virt_hybrid_hibernate_marker_write(vms, &err)) {
+        ret = -EIO;
+    }
+    if (!ret && !virt_hybrid_hibernate_marker_load(vms, &err)) {
+        ret = -EIO;
+    }
+    if (!ret) {
+        ARM_GICV3_COMMON(vms->gic)->hibernate_resume_pending = true;
+        ARM_GICV3_ITS_COMMON(vms->its)->hibernate_resume_pending = true;
+    }
+    if (ret) {
+        error_reportf_err(err, "mach-virt: cannot commit hibernation: ");
     }
     bql_unlock();
     return ret;
@@ -3657,14 +3779,9 @@ static void virt_machine_reset(MachineState *machine, ResetType type)
         virt_hybrid_cold_reset_ram(vms);
     }
 
-    if (reboot) {
-        vms->hybrid_hibernate_prepared = false;
-        vms->hybrid_ffa_rxtx_valid = false;
-        vms->hybrid_ffa_rxtx_map_count = 0;
-    }
-
     qemu_devices_reset(type);
     if (vms->hybrid_hibernate_marker_pending) {
+        virt_hybrid_hibernate_config_validate(vms, &error_fatal);
         virt_hybrid_hibernate_pci_restore(vms, &error_fatal);
     }
 
@@ -6164,6 +6281,7 @@ static void virt_instance_init(Object *obj)
     cxl_machine_init(obj, &vms->cxl_devices_state);
 
     vms->smmuv3_devices = g_ptr_array_new_with_free_func(NULL);
+    vms->hybrid_hibernate_its_state = gicv3_its_hibernate_state_new();
     vms->hybrid_hibernate_pci_states = g_ptr_array_new_with_free_func(
         virt_hybrid_hibernate_pci_state_free);
 }
@@ -6193,6 +6311,11 @@ static void virt_instance_finalize(Object *obj)
     g_free(vms->oem_id);
     g_free(vms->oem_table_id);
     g_free(vms->hybrid_hibernate_state_file);
+    g_free(vms->hybrid_hibernate_machine_type);
+    g_free(vms->hybrid_hibernate_cpu_type);
+    g_free(vms->hybrid_hibernate_gic_type);
+    g_free(vms->hybrid_hibernate_its_type);
+    gicv3_its_hibernate_state_free(vms->hybrid_hibernate_its_state);
     g_ptr_array_unref(vms->hybrid_hibernate_pci_states);
 }
 
