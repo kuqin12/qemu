@@ -2656,6 +2656,8 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
             error_report("mach-virt: timed-out hybrid secure call 0x%"
                          PRIx64 " did not stop; stopping the VM",
                          function_id);
+            vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_FAILED;
+            vms->hybrid_runtime_inflight = false;
             qemu_system_vmstop_request(RUN_STATE_INTERNAL_ERROR);
             qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
             return -ETIMEDOUT;
@@ -2779,6 +2781,7 @@ static bool virt_hybrid_shadow_prepare_reset(VirtMachineState *vms)
 
     qemu_mutex_lock(&vms->hybrid_shadow_mutex);
     ready = vms->hybrid_shadow_worker_alive &&
+        vms->hybrid_shadow_worker_done &&
         !vms->hybrid_shadow_worker_request &&
         !vms->hybrid_runtime_inflight;
     qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
