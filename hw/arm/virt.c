@@ -2513,7 +2513,7 @@ static void *virt_hybrid_shadow_worker(void *opaque)
         virt_hybrid_shadow_execute(vms);
         qemu_mutex_lock(&vms->hybrid_shadow_mutex);
         vms->hybrid_shadow_worker_done = true;
-        qemu_cond_signal(&vms->hybrid_shadow_cond);
+        qemu_cond_broadcast(&vms->hybrid_shadow_cond);
     }
 
     vms->hybrid_shadow_worker_alive = false;
@@ -2612,11 +2612,13 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
     if (!vms->hybrid_secure || !vms->hybrid_shadow_worker_created) {
         return -ENOTSUP;
     }
-    if (qemu_mutex_trylock(&vms->hybrid_shadow_mutex)) {
-        return -EBUSY;
+    qemu_mutex_lock(&vms->hybrid_shadow_mutex);
+    while (vms->hybrid_runtime_inflight &&
+           vms->hybrid_shadow_worker_alive) {
+        qemu_cond_wait(&vms->hybrid_shadow_cond,
+                       &vms->hybrid_shadow_mutex);
     }
-    if (vms->hybrid_runtime_inflight ||
-        !vms->hybrid_shadow_worker_alive) {
+    if (!vms->hybrid_shadow_worker_alive) {
         qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
         return -EBUSY;
     }
@@ -2659,6 +2661,7 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
             vms->hybrid_shadow_stage = HYBRID_SHADOW_STAGE_FAILED;
             vms->hybrid_runtime_inflight = false;
             qemu_system_vmstop_request(RUN_STATE_INTERNAL_ERROR);
+            qemu_cond_broadcast(&vms->hybrid_shadow_cond);
             qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
             return -ETIMEDOUT;
         }
@@ -2689,6 +2692,7 @@ int arm_hybrid_ffa_call(uint64_t regs[18])
     }
     vms->hybrid_runtime_inflight = false;
     qatomic_set(&vms->hybrid_runtime_cancel_requested, false);
+    qemu_cond_broadcast(&vms->hybrid_shadow_cond);
     qemu_mutex_unlock(&vms->hybrid_shadow_mutex);
     return ret;
 }
